@@ -1,0 +1,122 @@
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from matplotlib import animation
+
+
+@torch.no_grad()
+def nn_rollout_residual_1p(
+    model,
+    pos0,
+    vel0,
+    radius,
+    mass,
+    steps,
+    x_mean,
+    x_std,
+    y_mean,
+    y_std,
+    device,
+    dt,
+):
+    model.eval()
+    steps = int(steps)
+    dt = float(dt)
+
+    pos_pred = np.zeros((steps + 1, 1, 2), dtype=np.float32)
+    vel_pred = np.zeros((steps + 1, 1, 2), dtype=np.float32)
+    pos_pred[0] = pos0.astype(np.float32)
+    vel_pred[0] = vel0.astype(np.float32)
+
+    pos_t = pos_pred[0, 0].copy()
+    vel_t = vel_pred[0, 0].copy()
+
+    for t in range(steps):
+        x_raw = np.array(
+            [pos_t[0], pos_t[1], vel_t[0], vel_t[1], float(radius), float(mass)],
+            dtype=np.float32,
+        )
+        x_n = ((x_raw[None, :] - x_mean) / x_std).astype(np.float32)
+        x_torch = torch.from_numpy(x_n).to(device)
+
+        resid_n = model(x_torch).cpu().numpy()[0]
+        resid = (resid_n * y_std[0]) + y_mean[0]
+
+        pos_free = pos_t + vel_t * dt
+        vel_free = vel_t
+        y_free = np.array([pos_free[0], pos_free[1], vel_free[0], vel_free[1]], dtype=np.float32)
+        y_next = y_free + resid.astype(np.float32)
+
+        pos_t = y_next[0:2]
+        vel_t = y_next[2:4]
+
+        pos_pred[t + 1, 0] = pos_t
+        vel_pred[t + 1, 0] = vel_t
+
+        if not (np.isfinite(pos_t).all() and np.isfinite(vel_t).all()):
+            return pos_pred[: t + 2], vel_pred[: t + 2]
+
+    return pos_pred, vel_pred
+
+
+def animate_single_rollout_1p(pos, radius, W, H, dt, interval=20, title="Ground truth rollout"):
+    pos = np.asarray(pos, dtype=np.float32)
+    radius = float(radius)
+    dt = float(dt)
+
+    fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+    ax.set_xlim(0, W)
+    ax.set_ylim(0, H)
+    ax.set_aspect("equal")
+    ax.set_title(title)
+    ax.plot([0, W, W, 0, 0], [0, 0, H, H, 0], lw=2)
+
+    c = plt.Circle(pos[0, 0], radius, color="tab:blue", fill=True, alpha=0.9)
+    ax.add_patch(c)
+    time_text = fig.text(0.5, 0.98, "", ha="center")
+
+    def animate(frame):
+        c.center = pos[frame, 0]
+        time_text.set_text(f"t = {frame * dt:.2f}s")
+        return [c, time_text]
+
+    ani = animation.FuncAnimation(fig, animate, frames=len(pos), interval=interval, blit=True)
+    plt.close(fig)
+    return ani
+
+
+def animate_side_by_side_1p(pos_true, pos_pred, radius, W, H, dt, interval=20):
+    pos_true = np.asarray(pos_true, dtype=np.float32)
+    pos_pred = np.asarray(pos_pred, dtype=np.float32)
+    radius = float(radius)
+    dt = float(dt)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
+    for ax, title in [(ax1, "TRUE simulator"), (ax2, "NN rollout")]:
+        ax.set_xlim(0, W)
+        ax.set_ylim(0, H)
+        ax.set_aspect("equal")
+        ax.set_title(title)
+        ax.plot([0, W, W, 0, 0], [0, 0, H, H, 0], lw=2)
+
+    c_true = plt.Circle(pos_true[0, 0], radius, fill=True, alpha=0.9, color="tab:green")
+    c_pred = plt.Circle(pos_pred[0, 0], radius, fill=True, alpha=0.9, color="tab:orange")
+    ax1.add_patch(c_true)
+    ax2.add_patch(c_pred)
+    time_text = fig.text(0.5, 0.98, "", ha="center")
+
+    n_frames = min(len(pos_true), len(pos_pred))
+
+    def animate(frame):
+        c_true.center = pos_true[frame, 0]
+        c_pred.center = pos_pred[frame, 0]
+        time_text.set_text(f"t = {frame * dt:.2f}s")
+        return [c_true, c_pred, time_text]
+
+    ani = animation.FuncAnimation(fig, animate, frames=n_frames, interval=interval, blit=True)
+    plt.close(fig)
+    return ani
+
+
+def save_animation_mp4(anim, out_path, fps=50):
+    anim.save(out_path, fps=int(fps))
