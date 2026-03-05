@@ -81,7 +81,7 @@ def animate_single_rollout_1p(pos, radius, W, H, dt, interval=20, title="Ground 
     def animate(frame):
         trace_line.set_data(pos[: frame + 1, 0, 0], pos[: frame + 1, 0, 1])
         c.center = pos[frame, 0]
-        time_text.set_text(f"t = {frame * dt:.2f}s")
+        time_text.set_text(f"t = {frame * dt:.2f}s | step {frame}/{len(pos)-1}")
         return [trace_line, c, time_text]
 
     ani = animation.FuncAnimation(fig, animate, frames=len(pos), interval=interval, blit=True)
@@ -119,7 +119,7 @@ def animate_side_by_side_1p(pos_true, pos_pred, radius, W, H, dt, interval=20):
         trace_pred.set_data(pos_pred[: frame + 1, 0, 0], pos_pred[: frame + 1, 0, 1])
         c_true.center = pos_true[frame, 0]
         c_pred.center = pos_pred[frame, 0]
-        time_text.set_text(f"t = {frame * dt:.2f}s")
+        time_text.set_text(f"t = {frame * dt:.2f}s | step {frame}/{n_frames-1}")
         return [trace_true, trace_pred, c_true, c_pred, time_text]
 
     ani = animation.FuncAnimation(fig, animate, frames=n_frames, interval=interval, blit=True)

@@ -1,14 +1,15 @@
 import argparse
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from particle_nn_sim.simulator import ParticleSim2D
 from particle_nn_sim.models import ResMLP
-from particle_nn_sim.train import fit_standardizer, apply_standardizer, StepDataset, train
+from particle_nn_sim.train import fit_standardizer, apply_standardizer, StepDataset
 from particle_nn_sim.one_particle_data import collect_episodes_1p, episodes_to_XY_residual_1p
 from particle_nn_sim.one_particle_rollout import (
     animate_single_rollout_1p,
@@ -33,7 +34,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="One-particle wall-bounce training pipeline")
 
     # Data
-    p.add_argument("--episodes", type=int, default=300)
+    p.add_argument("--episodes", type=int, default=1000)
     p.add_argument("--steps", type=int, default=1000)
     p.add_argument("--dt", type=float, default=0.01)
     p.add_argument("--speed-max", type=float, default=0.7)
@@ -48,6 +49,10 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--collision-weight", type=float, default=10.0)
+    p.add_argument("--multistep-horizon", type=int, default=10)
+    p.add_argument("--rebalance-sampling", type=str2bool, default=True)
+    p.add_argument("--target-collision-frac", type=float, default=0.3)
 
     # Eval/output
     p.add_argument("--rollout-steps", type=int, default=1000)
@@ -77,6 +82,247 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+class RolloutDataset1P(Dataset):
+    """Provides fixed-horizon state sequences from one-particle episodes."""
+
+    def __init__(self, pos_all, vel_all, coll_all, episode_indices, horizon):
+        self.pos_all = pos_all
+        self.vel_all = vel_all
+        self.coll_all = coll_all
+        self.episode_indices = np.asarray(episode_indices, dtype=np.int64)
+        self.horizon = int(horizon)
+        self.T = pos_all.shape[1]
+        self.starts_per_episode = self.T - self.horizon
+        if self.starts_per_episode <= 0:
+            raise ValueError(
+                f"horizon={self.horizon} too large for T={self.T}. Need horizon < T."
+            )
+
+    def __len__(self):
+        return len(self.episode_indices) * self.starts_per_episode
+
+    def _decode(self, idx):
+        ep_idx = idx // self.starts_per_episode
+        t0 = idx % self.starts_per_episode
+        e = int(self.episode_indices[ep_idx])
+        return e, t0
+
+    def __getitem__(self, idx):
+        e, t0 = self._decode(idx)
+        state0 = np.concatenate(
+            [self.pos_all[e, t0, 0, :], self.vel_all[e, t0, 0, :]], axis=0
+        ).astype(np.float32)
+
+        pos_future = self.pos_all[e, t0 + 1 : t0 + 1 + self.horizon, 0, :]  # (H,2)
+        vel_future = self.vel_all[e, t0 + 1 : t0 + 1 + self.horizon, 0, :]  # (H,2)
+        state_future = np.concatenate([pos_future, vel_future], axis=1).astype(np.float32)  # (H,4)
+        coll_future = self.coll_all[e, t0 : t0 + self.horizon].astype(np.uint8)  # (H,)
+        return (
+            torch.from_numpy(state0).float(),
+            torch.from_numpy(state_future).float(),
+            torch.from_numpy(coll_future).long(),
+        )
+
+    def collision_window_labels(self):
+        labels = np.zeros(len(self), dtype=np.int64)
+        out_idx = 0
+        for e in self.episode_indices:
+            c = self.coll_all[int(e)].astype(np.int64)  # (T-1,)
+            csum = np.concatenate([[0], np.cumsum(c)])  # (T,)
+            # window [t, t+h-1]
+            hits = (csum[self.horizon :] - csum[: self.T - self.horizon]) > 0
+            n = len(hits)
+            labels[out_idx : out_idx + n] = hits.astype(np.int64)
+            out_idx += n
+        return labels
+
+
+def make_weighted_sampler(binary_labels, target_collision_frac):
+    labels = np.asarray(binary_labels, dtype=np.int64).reshape(-1)
+    n_col = int(labels.sum())
+    n_non = int((labels == 0).sum())
+    if n_col == 0 or n_non == 0:
+        return None
+
+    p_col = float(target_collision_frac)
+    alpha = (p_col / (1.0 - p_col)) * (n_non / max(1, n_col))
+    weights = np.ones_like(labels, dtype=np.float64)
+    weights[labels == 1] = alpha
+    return WeightedRandomSampler(
+        weights=torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(labels),
+        replacement=True,
+    )
+
+
+def train_multistep_1p(
+    model,
+    train_loader,
+    test_loader,
+    device,
+    epochs,
+    lr,
+    collision_weight,
+    x_mean,
+    x_std,
+    y_mean,
+    y_std,
+    dt,
+    radius,
+    mass,
+):
+    model.to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-6)
+
+    x_mean_t = torch.as_tensor(x_mean, dtype=torch.float32, device=device)
+    x_std_t = torch.as_tensor(x_std, dtype=torch.float32, device=device)
+    y_mean_t = torch.as_tensor(y_mean, dtype=torch.float32, device=device)
+    y_std_t = torch.as_tensor(y_std, dtype=torch.float32, device=device)
+    dt_t = float(dt)
+    r_t = float(radius)
+    m_t = float(mass)
+    cw = float(collision_weight)
+
+    history = {"train_loss": [], "test_mse_all": [], "test_mse_collision": [], "test_mse_noncollision": []}
+    best = {"epoch": -1, "mse_all": float("inf"), "state_dict": None, "stats": None}
+
+    def eval_loader(loader):
+        model.eval()
+        mse_all_sum = 0.0
+        mse_col_sum = 0.0
+        mse_non_sum = 0.0
+        n_all = n_col = n_non = 0
+        with torch.no_grad():
+            for state0, future_gt, coll_future in loader:
+                state0 = state0.to(device)  # (B,4)
+                future_gt = future_gt.to(device)  # (B,H,4)
+                coll_future = coll_future.to(device).bool()  # (B,H)
+
+                B, H, _ = future_gt.shape
+                state = state0
+                per_step_mse = []
+                per_step_coll = []
+                for k in range(H):
+                    x_raw = torch.cat(
+                        [
+                            state,
+                            torch.full((B, 1), r_t, device=device),
+                            torch.full((B, 1), m_t, device=device),
+                        ],
+                        dim=1,
+                    )  # (B,6)
+                    x_n = (x_raw - x_mean_t) / x_std_t
+                    resid_n = model(x_n)
+                    resid = resid_n * y_std_t + y_mean_t  # (B,4)
+
+                    pos = state[:, 0:2]
+                    vel = state[:, 2:4]
+                    pos_free = pos + vel * dt_t
+                    state_free = torch.cat([pos_free, vel], dim=1)
+                    state = state_free + resid
+
+                    gt_k = future_gt[:, k, :]
+                    mse_k = ((state - gt_k) ** 2).mean(dim=1)  # (B,)
+                    per_step_mse.append(mse_k)
+                    per_step_coll.append(coll_future[:, k])
+
+                mse = torch.stack(per_step_mse, dim=1)  # (B,H)
+                coll = torch.stack(per_step_coll, dim=1)  # (B,H)
+                non = ~coll
+
+                mse_all_sum += mse.sum().item()
+                n_all += mse.numel()
+
+                if coll.any():
+                    mse_col_sum += mse[coll].sum().item()
+                    n_col += int(coll.sum().item())
+                if non.any():
+                    mse_non_sum += mse[non].sum().item()
+                    n_non += int(non.sum().item())
+
+        return {
+            "mse_all": mse_all_sum / max(n_all, 1),
+            "mse_collision": mse_col_sum / max(n_col, 1),
+            "mse_noncollision": mse_non_sum / max(n_non, 1),
+            "n_all": n_all,
+            "n_collision": n_col,
+            "n_noncollision": n_non,
+        }
+
+    for ep in range(1, int(epochs) + 1):
+        model.train()
+        running = 0.0
+        n_samples = 0
+
+        for state0, future_gt, coll_future in train_loader:
+            state0 = state0.to(device)
+            future_gt = future_gt.to(device)
+            coll_future = coll_future.to(device).float()
+            B, H, _ = future_gt.shape
+
+            state = state0
+            step_losses = []
+            for k in range(H):
+                x_raw = torch.cat(
+                    [
+                        state,
+                        torch.full((B, 1), r_t, device=device),
+                        torch.full((B, 1), m_t, device=device),
+                    ],
+                    dim=1,
+                )
+                x_n = (x_raw - x_mean_t) / x_std_t
+                resid_n = model(x_n)
+                resid = resid_n * y_std_t + y_mean_t
+
+                pos = state[:, 0:2]
+                vel = state[:, 2:4]
+                pos_free = pos + vel * dt_t
+                state_free = torch.cat([pos_free, vel], dim=1)
+                state = state_free + resid
+
+                gt_k = future_gt[:, k, :]
+                mse_k = ((state - gt_k) ** 2).mean(dim=1)  # (B,)
+                if cw != 1.0:
+                    w = torch.where(coll_future[:, k] > 0, torch.full_like(mse_k, cw), torch.ones_like(mse_k))
+                    mse_k = w * mse_k
+                step_losses.append(mse_k.mean())
+
+            loss = torch.stack(step_losses).mean()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+            running += loss.item() * B
+            n_samples += B
+
+        train_loss = running / max(n_samples, 1)
+        stats = eval_loader(test_loader)
+        history["train_loss"].append(train_loss)
+        history["test_mse_all"].append(stats["mse_all"])
+        history["test_mse_collision"].append(stats["mse_collision"])
+        history["test_mse_noncollision"].append(stats["mse_noncollision"])
+
+        if stats["mse_all"] < best["mse_all"]:
+            best["mse_all"] = stats["mse_all"]
+            best["epoch"] = ep
+            best["state_dict"] = deepcopy(model.state_dict())
+            best["stats"] = stats
+
+        print(
+            f"Epoch {ep:03d} | train_loss={train_loss:.6f} "
+            f"| test_mse={stats['mse_all']:.6f} "
+            f"| test_collision={stats['mse_collision']:.6f} "
+            f"| test_noncollision={stats['mse_noncollision']:.6f} "
+            f"(n_col={stats['n_collision']}, n_noncol={stats['n_noncollision']})"
+        )
+
+    if best["state_dict"] is not None:
+        model.load_state_dict(best["state_dict"])
+    return model, best["stats"], history, best
 
 
 def main():
@@ -150,14 +396,25 @@ def main():
     Xte_n = apply_standardizer(Xte, x_mean, x_std)
     Yte_n = apply_standardizer(Yte, y_mean, y_std)
 
-    train_loader = DataLoader(
-        StepDataset(Xtr_n, Ytr_n, Ctr),
+    # Build rollout datasets for multi-step training.
+    train_roll_ds = RolloutDataset1P(pos_all, vel_all, coll_all, train_eps, args.multistep_horizon)
+    test_roll_ds = RolloutDataset1P(pos_all, vel_all, coll_all, test_eps, args.multistep_horizon)
+
+    if args.rebalance_sampling:
+        labels = train_roll_ds.collision_window_labels()
+        sampler = make_weighted_sampler(labels, args.target_collision_frac)
+    else:
+        sampler = None
+
+    train_roll_loader = DataLoader(
+        train_roll_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=sampler,
+        shuffle=(sampler is None),
         drop_last=True,
     )
-    test_loader = DataLoader(
-        StepDataset(Xte_n, Yte_n, Cte),
+    test_roll_loader = DataLoader(
+        test_roll_ds,
         batch_size=args.batch_size,
         shuffle=False,
     )
@@ -169,15 +426,21 @@ def main():
         blocks=args.blocks,
         dropout=args.dropout,
     )
-    stats, hist, _ = train(
+    model, stats, hist, best = train_multistep_1p(
         model,
-        train_loader,
-        test_loader,
+        train_roll_loader,
+        test_roll_loader,
         device=device,
         epochs=args.epochs,
         lr=args.lr,
-        collision_weight=1.0,
-        weight_decay=1e-6,
+        collision_weight=args.collision_weight,
+        x_mean=x_mean,
+        x_std=x_std,
+        y_mean=y_mean,
+        y_std=y_std,
+        dt=float(meta["dt"]),
+        radius=float(meta["radii"][0]),
+        mass=float(meta["masses"][0]),
     )
 
     # Rollout GT and model from the same test initial condition.
@@ -231,6 +494,7 @@ def main():
         "max_position_error": float(np.max(pos_err)),
         "final_position_error": float(pos_err[-1]),
         "test_stats": stats,
+        "best_epoch": int(best["epoch"]),
         "shape_checks": {
             "pos_all": list(pos_all.shape),
             "vel_all": list(vel_all.shape),
@@ -255,6 +519,7 @@ def main():
         },
         "hist": hist,
         "stats": stats,
+        "best_epoch": int(best["epoch"]),
         "x_mean": x_mean,
         "x_std": x_std,
         "y_mean": y_mean,

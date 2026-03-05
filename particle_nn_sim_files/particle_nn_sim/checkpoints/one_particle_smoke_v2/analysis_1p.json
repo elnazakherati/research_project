@@ -1,0 +1,63 @@
+{
+  "mean_position_error": 0.219749316573143,
+  "max_position_error": 0.4323391914367676,
+  "final_position_error": 0.4251638948917389,
+  "test_stats": {
+    "mse_all": 0.03372272276801282,
+    "mse_collision": 0.01846466412146886,
+    "mse_noncollision": 0.033822015496758735,
+    "n_all": 2320,
+    "n_collision": 15,
+    "n_noncollision": 2305
+  },
+  "best_epoch": 1,
+  "shape_checks": {
+    "pos_all": [
+      20,
+      121,
+      1,
+      2
+    ],
+    "vel_all": [
+      20,
+      121,
+      1,
+      2
+    ],
+    "Xtr": [
+      1920,
+      6
+    ],
+    "Ytr": [
+      1920,
+      4
+    ]
+  },
+  "config": {
+    "episodes": 20,
+    "steps": 120,
+    "dt": 0.01,
+    "speed_max": 0.7,
+    "train_split": 0.8,
+    "radius": 0.0,
+    "mass": 1.0,
+    "hidden": 128,
+    "blocks": 3,
+    "dropout": 0.05,
+    "epochs": 2,
+    "lr": 0.001,
+    "batch_size": 64,
+    "collision_weight": 10.0,
+    "multistep_horizon": 5,
+    "rebalance_sampling": true,
+    "target_collision_frac": 0.3,
+    "rollout_steps": 80,
+    "fps": 10,
+    "out_dir": "/Users/elnaz/Desktop/UCD/Research/research/research_project/particle_nn_sim_files/particle_nn_sim/checkpoints/one_particle_smoke_v2",
+    "device": "auto",
+    "seed": 0,
+    "save_train_episode_preview": true,
+    "preview_episode_idx": 0,
+    "preview_fps": 10
+  }
+}
