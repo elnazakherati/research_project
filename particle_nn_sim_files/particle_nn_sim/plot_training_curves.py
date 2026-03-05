@@ -32,6 +32,21 @@ def save_curve(values, ylabel, title, out_path):
     plt.close()
 
 
+def save_train_test_overlay(train_values, test_values, out_path):
+    epochs = range(1, min(len(train_values), len(test_values)) + 1)
+    plt.figure(figsize=(7, 4))
+    plt.plot(epochs, train_values[: len(epochs)], lw=2, label="train_loss")
+    plt.plot(epochs, test_values[: len(epochs)], lw=2, label="test_mse_all")
+    plt.xlabel("epoch")
+    plt.ylabel("loss / mse")
+    plt.title("Train Loss vs Test MSE (All)")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+
 def main():
     args = parse_args()
     ckpt_path = Path(args.ckpt)
@@ -71,12 +86,17 @@ def main():
 
     for name, (ylabel, title, values) in outputs.items():
         save_curve(values, ylabel, title, out_dir / name)
+    save_train_test_overlay(
+        hist["train_loss"],
+        hist["test_mse_all"],
+        out_dir / "train_vs_test_mse_all_1p.png",
+    )
 
     print("Saved training curves:")
     for name in outputs:
         print(" -", out_dir / name)
+    print(" -", out_dir / "train_vs_test_mse_all_1p.png")
 
 
 if __name__ == "__main__":
     main()
-
