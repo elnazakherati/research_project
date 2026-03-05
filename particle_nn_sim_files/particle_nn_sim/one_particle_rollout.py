@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from matplotlib import animation
+from pathlib import Path
 
 
 @torch.no_grad()
@@ -63,6 +64,7 @@ def animate_single_rollout_1p(pos, radius, W, H, dt, interval=20, title="Ground 
     pos = np.asarray(pos, dtype=np.float32)
     radius = float(radius)
     dt = float(dt)
+    display_radius = max(radius, 0.015 * min(float(W), float(H)))
 
     fig, ax = plt.subplots(1, 1, figsize=(5, 5))
     ax.set_xlim(0, W)
@@ -71,7 +73,7 @@ def animate_single_rollout_1p(pos, radius, W, H, dt, interval=20, title="Ground 
     ax.set_title(title)
     ax.plot([0, W, W, 0, 0], [0, 0, H, H, 0], lw=2)
 
-    c = plt.Circle(pos[0, 0], radius, color="tab:blue", fill=True, alpha=0.9)
+    c = plt.Circle(pos[0, 0], display_radius, color="tab:blue", fill=True, alpha=0.9)
     ax.add_patch(c)
     time_text = fig.text(0.5, 0.98, "", ha="center")
 
@@ -90,6 +92,7 @@ def animate_side_by_side_1p(pos_true, pos_pred, radius, W, H, dt, interval=20):
     pos_pred = np.asarray(pos_pred, dtype=np.float32)
     radius = float(radius)
     dt = float(dt)
+    display_radius = max(radius, 0.015 * min(float(W), float(H)))
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
     for ax, title in [(ax1, "TRUE simulator"), (ax2, "NN rollout")]:
@@ -99,8 +102,8 @@ def animate_side_by_side_1p(pos_true, pos_pred, radius, W, H, dt, interval=20):
         ax.set_title(title)
         ax.plot([0, W, W, 0, 0], [0, 0, H, H, 0], lw=2)
 
-    c_true = plt.Circle(pos_true[0, 0], radius, fill=True, alpha=0.9, color="tab:green")
-    c_pred = plt.Circle(pos_pred[0, 0], radius, fill=True, alpha=0.9, color="tab:orange")
+    c_true = plt.Circle(pos_true[0, 0], display_radius, fill=True, alpha=0.9, color="tab:green")
+    c_pred = plt.Circle(pos_pred[0, 0], display_radius, fill=True, alpha=0.9, color="tab:orange")
     ax1.add_patch(c_true)
     ax2.add_patch(c_pred)
     time_text = fig.text(0.5, 0.98, "", ha="center")
@@ -119,4 +122,24 @@ def animate_side_by_side_1p(pos_true, pos_pred, radius, W, H, dt, interval=20):
 
 
 def save_animation_mp4(anim, out_path, fps=50):
-    anim.save(out_path, fps=int(fps))
+    out_path = str(out_path)
+    suffix = Path(out_path).suffix.lower()
+    fps = int(fps)
+
+    if suffix == ".mp4":
+        if not animation.writers.is_available("ffmpeg"):
+            raise RuntimeError(
+                "ffmpeg is required to save MP4 but was not found in PATH. "
+                "Install ffmpeg (e.g., `conda install -c conda-forge ffmpeg`) "
+                "or save as .gif instead."
+            )
+        writer = animation.FFMpegWriter(fps=fps)
+        anim.save(out_path, writer=writer)
+        return
+
+    if suffix == ".gif":
+        writer = animation.PillowWriter(fps=fps)
+        anim.save(out_path, writer=writer)
+        return
+
+    raise ValueError(f"Unsupported animation extension: {suffix}. Use .mp4 or .gif.")
