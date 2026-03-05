@@ -3,6 +3,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from particle_nn_sim.models import ResMLP
 from particle_nn_sim.simulator import ParticleSim2D
@@ -110,11 +114,22 @@ def main():
         save_animation_mp4(anim, str(out_mp4), fps=args.fps)
 
         pos_err = np.linalg.norm(pos_true[:, 0, :] - pos_pred[:, 0, :], axis=1)
+        plot_path = out_dir / f"rollout_{i:03d}_error_vs_step.png"
+        plt.figure(figsize=(7, 4))
+        plt.plot(np.arange(len(pos_err)), pos_err, lw=2, color="tab:red")
+        plt.xlabel("step")
+        plt.ylabel("position error ||x_pred - x_true||")
+        plt.title(f"Rollout {i:03d} Error vs Time Step")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(plot_path, dpi=150)
+        plt.close()
         print(
             f"[{i+1}/{args.num_rollouts}] saved {out_mp4.name} | "
             f"mean_err={float(np.mean(pos_err)):.6f} "
             f"max_err={float(np.max(pos_err)):.6f} "
-            f"final_err={float(pos_err[-1]):.6f}"
+            f"final_err={float(pos_err[-1]):.6f} | "
+            f"plot={plot_path.name}"
         )
 
     print("Done.")

@@ -2,10 +2,15 @@ import argparse
 import json
 from copy import deepcopy
 from pathlib import Path
+import time
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from particle_nn_sim.simulator import ParticleSim2D
 from particle_nn_sim.models import ResMLP
@@ -65,6 +70,11 @@ def parse_args():
     p.add_argument("--save-train-episode-preview", type=str2bool, default=True)
     p.add_argument("--preview-episode-idx", type=int, default=0)
     p.add_argument("--preview-fps", type=int, default=50)
+    p.add_argument("--use-wandb", type=str2bool, default=False)
+    p.add_argument("--wandb-project", type=str, default="particle-nn-sim")
+    p.add_argument("--wandb-entity", type=str, default="")
+    p.add_argument("--wandb-run-name", type=str, default="")
+    p.add_argument("--wandb-tags", type=str, default="")
 
     return p.parse_args()
 
@@ -172,6 +182,7 @@ def train_multistep_1p(
     dt,
     radius,
     mass,
+    wandb_run=None,
 ):
     model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-6)
@@ -252,6 +263,7 @@ def train_multistep_1p(
         }
 
     for ep in range(1, int(epochs) + 1):
+        t0 = time.time()
         model.train()
         running = 0.0
         n_samples = 0
@@ -311,14 +323,31 @@ def train_multistep_1p(
             best["epoch"] = ep
             best["state_dict"] = deepcopy(model.state_dict())
             best["stats"] = stats
+        epoch_sec = time.time() - t0
 
         print(
             f"Epoch {ep:03d} | train_loss={train_loss:.6f} "
             f"| test_mse={stats['mse_all']:.6f} "
             f"| test_collision={stats['mse_collision']:.6f} "
             f"| test_noncollision={stats['mse_noncollision']:.6f} "
-            f"(n_col={stats['n_collision']}, n_noncol={stats['n_noncollision']})"
+            f"(n_col={stats['n_collision']}, n_noncol={stats['n_noncollision']}) "
+            f"| best_epoch={best['epoch']} | sec={epoch_sec:.2f}"
         )
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "epoch": ep,
+                    "train_loss": train_loss,
+                    "test_mse_all": stats["mse_all"],
+                    "test_mse_collision": stats["mse_collision"],
+                    "test_mse_noncollision": stats["mse_noncollision"],
+                    "test_n_collision": stats["n_collision"],
+                    "test_n_noncollision": stats["n_noncollision"],
+                    "best_mse_all_so_far": best["mse_all"],
+                    "best_epoch_so_far": best["epoch"],
+                    "epoch_seconds": epoch_sec,
+                }
+            )
 
     if best["state_dict"] is not None:
         model.load_state_dict(best["state_dict"])
@@ -329,6 +358,27 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     device = resolve_device(args.device)
+    if device == "cuda":
+        gpu_name = torch.cuda.get_device_name(0)
+    else:
+        gpu_name = "cpu"
+
+    print(f"Device: {device} ({gpu_name})")
+    print(
+        "Config:",
+        {
+            "episodes": args.episodes,
+            "steps": args.steps,
+            "dt": args.dt,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "multistep_horizon": args.multistep_horizon,
+            "collision_weight": args.collision_weight,
+            "rebalance_sampling": args.rebalance_sampling,
+            "target_collision_frac": args.target_collision_frac,
+            "seed": args.seed,
+        },
+    )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -353,6 +403,32 @@ def main():
         speed_max=args.speed_max,
         seed=args.seed,
     )
+    print(
+        f"Generated episodes: pos_all={pos_all.shape}, vel_all={vel_all.shape}, "
+        f"collision_frames={int(coll_all.sum())}/{coll_all.size}"
+    )
+
+    wandb_run = None
+    if args.use_wandb:
+        try:
+            import wandb  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                "--use-wandb was set but wandb is not available. "
+                "Install with `pip install wandb` in your environment."
+            ) from e
+        tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
+        init_kwargs = {
+            "project": args.wandb_project,
+            "config": vars(args),
+            "tags": tags,
+            "dir": str(out_dir),
+        }
+        if args.wandb_entity:
+            init_kwargs["entity"] = args.wandb_entity
+        if args.wandb_run_name:
+            init_kwargs["name"] = args.wandb_run_name
+        wandb_run = wandb.init(**init_kwargs)
 
     # Preview one raw training episode from GT.
     if args.save_train_episode_preview:
@@ -399,12 +475,22 @@ def main():
     # Build rollout datasets for multi-step training.
     train_roll_ds = RolloutDataset1P(pos_all, vel_all, coll_all, train_eps, args.multistep_horizon)
     test_roll_ds = RolloutDataset1P(pos_all, vel_all, coll_all, test_eps, args.multistep_horizon)
+    print(
+        f"Dataset windows: train={len(train_roll_ds)}, test={len(test_roll_ds)} "
+        f"| one-step train={Xtr.shape[0]}, test={Xte.shape[0]}"
+    )
 
     if args.rebalance_sampling:
         labels = train_roll_ds.collision_window_labels()
         sampler = make_weighted_sampler(labels, args.target_collision_frac)
+        print(
+            f"Rebalance labels: collision_windows={int(labels.sum())}, "
+            f"noncollision_windows={int((labels==0).sum())}, "
+            f"sampler={'on' if sampler is not None else 'off'}"
+        )
     else:
         sampler = None
+        print("Rebalance sampling disabled.")
 
     train_roll_loader = DataLoader(
         train_roll_ds,
@@ -441,6 +527,7 @@ def main():
         dt=float(meta["dt"]),
         radius=float(meta["radii"][0]),
         mass=float(meta["masses"][0]),
+        wandb_run=wandb_run,
     )
 
     # Rollout GT and model from the same test initial condition.
@@ -489,10 +576,21 @@ def main():
 
     # Analysis metrics.
     pos_err = np.linalg.norm(pos_true[:, 0, :] - pos_pred[:, 0, :], axis=1)
+    err_plot_path = out_dir / "error_vs_timestep_1p.png"
+    plt.figure(figsize=(7, 4))
+    plt.plot(np.arange(len(pos_err)), pos_err, lw=2, color="tab:red")
+    plt.xlabel("step")
+    plt.ylabel("position error ||x_pred - x_true||")
+    plt.title("One-Particle Rollout Error vs Time Step")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(err_plot_path, dpi=150)
+    plt.close()
     analysis = {
         "mean_position_error": float(np.mean(pos_err)),
         "max_position_error": float(np.max(pos_err)),
         "final_position_error": float(pos_err[-1]),
+        "error_plot_path": str(err_plot_path),
         "test_stats": stats,
         "best_epoch": int(best["epoch"]),
         "shape_checks": {
@@ -529,10 +627,21 @@ def main():
     }
     torch.save(ckpt, out_dir / "model_1p_resmlp.pt")
 
+    if wandb_run is not None:
+        wandb_run.summary["best_epoch"] = int(best["epoch"])
+        wandb_run.summary["mean_position_error"] = analysis["mean_position_error"]
+        wandb_run.summary["max_position_error"] = analysis["max_position_error"]
+        wandb_run.summary["final_position_error"] = analysis["final_position_error"]
+        wandb_run.summary["final_test_mse_all"] = stats["mse_all"]
+        wandb_run.summary["final_test_mse_collision"] = stats["mse_collision"]
+        wandb_run.summary["final_test_mse_noncollision"] = stats["mse_noncollision"]
+        wandb_run.finish()
+
     print("Run complete.")
     print("Artifacts:")
     print(" -", out_dir / "model_1p_resmlp.pt")
     print(" -", out_dir / "analysis_1p.json")
+    print(" -", out_dir / "error_vs_timestep_1p.png")
     print(" -", out_dir / "rollout_gt_vs_pred_1p.mp4")
     if args.save_train_episode_preview:
         print(" -", out_dir / "training_episode_example_1p.mp4")
