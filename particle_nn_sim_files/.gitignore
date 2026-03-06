@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Experiment outputs
+checkpoints/
+particle_nn_sim/checkpoints/
+wandb/
+
+# Large/generated artifacts
+*.mp4
+*.pt
+*.png
+
+# Keep hand-written JSON files tracked by default.
+# If you also want to ignore generated json metrics, uncomment:
+# *.json
