@@ -1,0 +1,68 @@
+{
+  "mean_position_error": 0.024682611227035522,
+  "max_position_error": 0.05524095892906189,
+  "final_position_error": 0.05524095892906189,
+  "test_stats": {
+    "mse_all": 0.019199307027616,
+    "mse_collision": 0.0,
+    "mse_noncollision": 0.019199307027616,
+    "n_all": 760,
+    "n_collision": 0,
+    "n_noncollision": 760
+  },
+  "best_epoch": 1,
+  "shape_checks": {
+    "pos_all": [
+      10,
+      81,
+      1,
+      2
+    ],
+    "vel_all": [
+      10,
+      81,
+      1,
+      2
+    ],
+    "Xtr": [
+      640,
+      6
+    ],
+    "Ytr": [
+      640,
+      4
+    ]
+  },
+  "config": {
+    "episodes": 10,
+    "steps": 80,
+    "dt": 0.01,
+    "speed_max": 0.7,
+    "train_split": 0.8,
+    "radius": 0.0,
+    "mass": 1.0,
+    "hidden": 128,
+    "blocks": 3,
+    "dropout": 0.05,
+    "epochs": 1,
+    "lr": 0.001,
+    "batch_size": 32,
+    "collision_weight": 10.0,
+    "multistep_horizon": 5,
+    "rebalance_sampling": true,
+    "target_collision_frac": 0.3,
+    "rollout_steps": 40,
+    "fps": 10,
+    "out_dir": "/Users/elnaz/Desktop/UCD/Research/research/research_project/particle_nn_sim_files/particle_nn_sim/checkpoints/one_particle_wandb_smoke",
+    "device": "auto",
+    "seed": 0,
+    "save_train_episode_preview": true,
+    "preview_episode_idx": 0,
+    "preview_fps": 10,
+    "use_wandb": false,
+    "wandb_project": "particle-nn-sim",
+    "wandb_entity": "",
+    "wandb_run_name": "",
+    "wandb_tags": ""
+  }
+}
