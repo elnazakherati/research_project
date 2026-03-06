@@ -76,13 +76,22 @@ def animate_single_rollout_1p(pos, radius, W, H, dt, interval=20, title="Ground 
     (trace_line,) = ax.plot([], [], color="tab:blue", lw=1.8, alpha=0.8)
     c = plt.Circle(pos[0, 0], display_radius, color="tab:blue", fill=True, alpha=0.9)
     ax.add_patch(c)
-    time_text = fig.text(0.5, 0.98, "", ha="center")
+    step_text = ax.text(
+        0.02,
+        0.98,
+        "",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+    )
 
     def animate(frame):
         trace_line.set_data(pos[: frame + 1, 0, 0], pos[: frame + 1, 0, 1])
         c.center = pos[frame, 0]
-        time_text.set_text(f"t = {frame * dt:.2f}s | step {frame}/{len(pos)-1}")
-        return [trace_line, c, time_text]
+        step_text.set_text(f"t={frame * dt:.2f}s | step {frame}/{len(pos)-1}")
+        return [trace_line, c, step_text]
 
     ani = animation.FuncAnimation(fig, animate, frames=len(pos), interval=interval, blit=True)
     plt.close(fig)
@@ -110,7 +119,26 @@ def animate_side_by_side_1p(pos_true, pos_pred, radius, W, H, dt, interval=20):
     c_pred = plt.Circle(pos_pred[0, 0], display_radius, fill=True, alpha=0.9, color="tab:orange")
     ax1.add_patch(c_true)
     ax2.add_patch(c_pred)
-    time_text = fig.text(0.5, 0.98, "", ha="center")
+    step_text_l = ax1.text(
+        0.02,
+        0.98,
+        "",
+        transform=ax1.transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+    )
+    step_text_r = ax2.text(
+        0.02,
+        0.98,
+        "",
+        transform=ax2.transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+    )
 
     n_frames = min(len(pos_true), len(pos_pred))
 
@@ -119,8 +147,10 @@ def animate_side_by_side_1p(pos_true, pos_pred, radius, W, H, dt, interval=20):
         trace_pred.set_data(pos_pred[: frame + 1, 0, 0], pos_pred[: frame + 1, 0, 1])
         c_true.center = pos_true[frame, 0]
         c_pred.center = pos_pred[frame, 0]
-        time_text.set_text(f"t = {frame * dt:.2f}s | step {frame}/{n_frames-1}")
-        return [trace_true, trace_pred, c_true, c_pred, time_text]
+        txt = f"t={frame * dt:.2f}s | step {frame}/{n_frames-1}"
+        step_text_l.set_text(txt)
+        step_text_r.set_text(txt)
+        return [trace_true, trace_pred, c_true, c_pred, step_text_l, step_text_r]
 
     ani = animation.FuncAnimation(fig, animate, frames=n_frames, interval=interval, blit=True)
     plt.close(fig)
