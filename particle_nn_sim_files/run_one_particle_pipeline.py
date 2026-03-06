@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 
 from particle_nn_sim.simulator import ParticleSim2D
 from particle_nn_sim.models import ResMLP
-from particle_nn_sim.train import fit_standardizer, apply_standardizer, StepDataset
+from particle_nn_sim.train import fit_standardizer, apply_standardizer
 from particle_nn_sim.one_particle_data import collect_episodes_1p, episodes_to_XY_residual_1p
 from particle_nn_sim.one_particle_rollout import (
     animate_single_rollout_1p,
@@ -56,6 +56,19 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--collision-weight", type=float, default=10.0)
     p.add_argument("--multistep-horizon", type=int, default=10)
+    p.add_argument(
+        "--target-mode",
+        type=str,
+        default="dv",
+        choices=["state_residual", "dv"],
+        help="state_residual: predict 4D residual [dx,dy,dvx,dvy]; dv: predict 2D velocity correction only",
+    )
+    p.add_argument(
+        "--noncollision-dv-penalty",
+        type=float,
+        default=1.0,
+        help="Penalty weight on ||dv||^2 for non-collision frames (effective in dv mode).",
+    )
     p.add_argument("--rebalance-sampling", type=str2bool, default=True)
     p.add_argument("--target-collision-frac", type=float, default=0.3)
 
@@ -175,6 +188,8 @@ def train_multistep_1p(
     epochs,
     lr,
     collision_weight,
+    target_mode,
+    noncollision_dv_penalty,
     x_mean,
     x_std,
     y_mean,
@@ -195,6 +210,8 @@ def train_multistep_1p(
     r_t = float(radius)
     m_t = float(mass)
     cw = float(collision_weight)
+    tmode = str(target_mode)
+    dv_reg_w = float(noncollision_dv_penalty)
 
     history = {"train_loss": [], "test_mse_all": [], "test_mse_collision": [], "test_mse_noncollision": []}
     best = {"epoch": -1, "mse_all": float("inf"), "state_dict": None, "stats": None}
@@ -225,14 +242,20 @@ def train_multistep_1p(
                         dim=1,
                     )  # (B,6)
                     x_n = (x_raw - x_mean_t) / x_std_t
-                    resid_n = model(x_n)
-                    resid = resid_n * y_std_t + y_mean_t  # (B,4)
+                    pred_n = model(x_n)
+                    pred = pred_n * y_std_t + y_mean_t
 
                     pos = state[:, 0:2]
                     vel = state[:, 2:4]
                     pos_free = pos + vel * dt_t
-                    state_free = torch.cat([pos_free, vel], dim=1)
-                    state = state_free + resid
+                    if tmode == "state_residual":
+                        state_free = torch.cat([pos_free, vel], dim=1)
+                        state = state_free + pred
+                    elif tmode == "dv":
+                        vel_next = vel + pred
+                        state = torch.cat([pos_free, vel_next], dim=1)
+                    else:
+                        raise ValueError(f"Unknown target_mode: {tmode}")
 
                     gt_k = future_gt[:, k, :]
                     mse_k = ((state - gt_k) ** 2).mean(dim=1)  # (B,)
@@ -286,21 +309,33 @@ def train_multistep_1p(
                     dim=1,
                 )
                 x_n = (x_raw - x_mean_t) / x_std_t
-                resid_n = model(x_n)
-                resid = resid_n * y_std_t + y_mean_t
+                pred_n = model(x_n)
+                pred = pred_n * y_std_t + y_mean_t
 
                 pos = state[:, 0:2]
                 vel = state[:, 2:4]
                 pos_free = pos + vel * dt_t
-                state_free = torch.cat([pos_free, vel], dim=1)
-                state = state_free + resid
+                if tmode == "state_residual":
+                    state_free = torch.cat([pos_free, vel], dim=1)
+                    state = state_free + pred
+                elif tmode == "dv":
+                    vel_next = vel + pred
+                    state = torch.cat([pos_free, vel_next], dim=1)
+                else:
+                    raise ValueError(f"Unknown target_mode: {tmode}")
 
                 gt_k = future_gt[:, k, :]
                 mse_k = ((state - gt_k) ** 2).mean(dim=1)  # (B,)
                 if cw != 1.0:
                     w = torch.where(coll_future[:, k] > 0, torch.full_like(mse_k, cw), torch.ones_like(mse_k))
                     mse_k = w * mse_k
-                step_losses.append(mse_k.mean())
+                loss_k = mse_k.mean()
+                if tmode == "dv" and dv_reg_w > 0.0:
+                    non_mask = coll_future[:, k] <= 0
+                    if non_mask.any():
+                        dv_pen = (pred[non_mask] ** 2).mean()
+                        loss_k = loss_k + dv_reg_w * dv_pen
+                step_losses.append(loss_k)
 
             loss = torch.stack(step_losses).mean()
             opt.zero_grad(set_to_none=True)
@@ -373,6 +408,8 @@ def main():
             "epochs": args.epochs,
             "batch_size": args.batch_size,
             "multistep_horizon": args.multistep_horizon,
+            "target_mode": args.target_mode,
+            "noncollision_dv_penalty": args.noncollision_dv_penalty,
             "collision_weight": args.collision_weight,
             "rebalance_sampling": args.rebalance_sampling,
             "target_collision_frac": args.target_collision_frac,
@@ -460,17 +497,26 @@ def main():
     if len(test_eps) == 0:
         raise ValueError("No test episodes. Lower --train-split or increase --episodes.")
 
-    Xtr, Ytr, Ctr = episodes_to_XY_residual_1p(pos_all, vel_all, coll_all, meta, train_eps)
-    Xte, Yte, Cte = episodes_to_XY_residual_1p(pos_all, vel_all, coll_all, meta, test_eps)
-    if Xtr.shape[1] != 6 or Ytr.shape[1] != 4:
+    Xtr, Ytr_full, Ctr = episodes_to_XY_residual_1p(pos_all, vel_all, coll_all, meta, train_eps)
+    Xte, Yte_full, Cte = episodes_to_XY_residual_1p(pos_all, vel_all, coll_all, meta, test_eps)
+    if args.target_mode == "state_residual":
+        Ytr = Ytr_full
+        Yte = Yte_full
+    elif args.target_mode == "dv":
+        Ytr = Ytr_full[:, 2:4].copy()
+        Yte = Yte_full[:, 2:4].copy()
+    else:
+        raise ValueError(f"Unknown target_mode: {args.target_mode}")
+    if Xtr.shape[1] != 6 or Ytr.shape[1] not in (2, 4):
         raise RuntimeError(f"Unexpected shapes: Xtr={Xtr.shape}, Ytr={Ytr.shape}")
 
     x_mean, x_std = fit_standardizer(Xtr)
     y_mean, y_std = fit_standardizer(Ytr)
-    Xtr_n = apply_standardizer(Xtr, x_mean, x_std)
-    Ytr_n = apply_standardizer(Ytr, y_mean, y_std)
-    Xte_n = apply_standardizer(Xte, x_mean, x_std)
-    Yte_n = apply_standardizer(Yte, y_mean, y_std)
+    # Keep normalized arrays for shape sanity/debug and checkpoint compatibility.
+    _ = apply_standardizer(Xtr, x_mean, x_std)
+    _ = apply_standardizer(Ytr, y_mean, y_std)
+    _ = apply_standardizer(Xte, x_mean, x_std)
+    _ = apply_standardizer(Yte, y_mean, y_std)
 
     # Build rollout datasets for multi-step training.
     train_roll_ds = RolloutDataset1P(pos_all, vel_all, coll_all, train_eps, args.multistep_horizon)
@@ -508,7 +554,7 @@ def main():
     model = ResMLP(
         in_dim=6,
         hidden=args.hidden,
-        out_dim=4,
+        out_dim=int(Ytr.shape[1]),
         blocks=args.blocks,
         dropout=args.dropout,
     )
@@ -520,6 +566,8 @@ def main():
         epochs=args.epochs,
         lr=args.lr,
         collision_weight=args.collision_weight,
+        target_mode=args.target_mode,
+        noncollision_dv_penalty=args.noncollision_dv_penalty,
         x_mean=x_mean,
         x_std=x_std,
         y_mean=y_mean,
@@ -561,6 +609,7 @@ def main():
         y_std=y_std,
         device=device,
         dt=float(meta["dt"]),
+        target_mode=args.target_mode,
     )
 
     # Save GT-vs-pred animation.
@@ -611,7 +660,7 @@ def main():
         "model_kwargs": {
             "in_dim": 6,
             "hidden": args.hidden,
-            "out_dim": 4,
+            "out_dim": int(Ytr.shape[1]),
             "blocks": args.blocks,
             "dropout": args.dropout,
         },
