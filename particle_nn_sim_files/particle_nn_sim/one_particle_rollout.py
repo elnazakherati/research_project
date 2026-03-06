@@ -19,7 +19,6 @@ def nn_rollout_residual_1p(
     y_std,
     device,
     dt,
-    target_mode="state_residual",
 ):
     model.eval()
     steps = int(steps)
@@ -41,22 +40,16 @@ def nn_rollout_residual_1p(
         x_n = ((x_raw[None, :] - x_mean) / x_std).astype(np.float32)
         x_torch = torch.from_numpy(x_n).to(device)
 
-        pred_n = model(x_torch).cpu().numpy()[0]
-        pred = (pred_n * y_std[0]) + y_mean[0]
+        resid_n = model(x_torch).cpu().numpy()[0]
+        resid = (resid_n * y_std[0]) + y_mean[0]
 
         pos_free = pos_t + vel_t * dt
         vel_free = vel_t
-        if target_mode == "state_residual":
-            y_free = np.array([pos_free[0], pos_free[1], vel_free[0], vel_free[1]], dtype=np.float32)
-            y_next = y_free + pred.astype(np.float32)
-            pos_t = y_next[0:2]
-            vel_t = y_next[2:4]
-        elif target_mode == "dv":
-            dv = pred.astype(np.float32)
-            pos_t = pos_free
-            vel_t = vel_free + dv
-        else:
-            raise ValueError(f"Unknown target_mode: {target_mode}")
+        y_free = np.array([pos_free[0], pos_free[1], vel_free[0], vel_free[1]], dtype=np.float32)
+        y_next = y_free + resid.astype(np.float32)
+
+        pos_t = y_next[0:2]
+        vel_t = y_next[2:4]
 
         pos_pred[t + 1, 0] = pos_t
         vel_pred[t + 1, 0] = vel_t

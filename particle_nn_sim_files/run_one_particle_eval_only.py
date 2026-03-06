@@ -62,10 +62,6 @@ def main():
     y_mean = np.asarray(ckpt["y_mean"], dtype=np.float32)
     y_std = np.asarray(ckpt["y_std"], dtype=np.float32)
     meta = ckpt["meta"]
-    cfg = ckpt.get("config", {})
-    target_mode = str(cfg.get("target_mode", ""))
-    if target_mode not in {"state_residual", "dv"}:
-        target_mode = "dv" if int(np.asarray(y_mean).shape[-1]) == 2 else "state_residual"
 
     W = float(meta["W"])
     H = float(meta["H"])
@@ -104,7 +100,6 @@ def main():
             y_std=y_std,
             device=device,
             dt=dt,
-            target_mode=target_mode,
         )
 
         anim = animate_side_by_side_1p(
