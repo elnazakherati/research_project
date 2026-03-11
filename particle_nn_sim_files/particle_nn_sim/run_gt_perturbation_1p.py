@@ -33,6 +33,10 @@ def parse_args():
     p.add_argument("--mass", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--perturb-seed", type=int, default=123)
+    p.add_argument("--fixed-x", type=float, default=None, help="Optional fixed initial x position.")
+    p.add_argument("--fixed-y", type=float, default=None, help="Optional fixed initial y position.")
+    p.add_argument("--fixed-vx", type=float, default=None, help="Optional fixed initial vx.")
+    p.add_argument("--fixed-vy", type=float, default=None, help="Optional fixed initial vy.")
     p.add_argument("--fps", type=int, default=50)
     p.add_argument("--frame-stride", type=int, default=1, help="Use every k-th frame when rendering videos.")
     p.add_argument(
@@ -52,6 +56,10 @@ def main():
         raise ValueError("--perturb-step must satisfy 0 <= perturb_step <= steps")
     if args.frame_stride < 1:
         raise ValueError("--frame-stride must be >= 1")
+    if (args.fixed_x is None) != (args.fixed_y is None):
+        raise ValueError("Set both --fixed-x and --fixed-y, or neither.")
+    if (args.fixed_vx is None) != (args.fixed_vy is None):
+        raise ValueError("Set both --fixed-vx and --fixed-vy, or neither.")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -59,9 +67,23 @@ def main():
     H = 1.0
     radius_eff = args.radius if args.radius > 0.0 else 1e-6
 
-    pos0, vel0 = sample_init_1p(W, H, radius_eff, speed_max=args.speed_max, seed=args.seed)
-    pos0 = pos0.astype(np.float32)
-    vel0 = vel0.astype(np.float32)
+    if args.fixed_x is not None and args.fixed_vx is not None:
+        pos0 = np.array([[float(args.fixed_x), float(args.fixed_y)]], dtype=np.float32)
+        vel0 = np.array([[float(args.fixed_vx), float(args.fixed_vy)]], dtype=np.float32)
+    elif args.fixed_x is not None:
+        pos0 = np.array([[float(args.fixed_x), float(args.fixed_y)]], dtype=np.float32)
+        _, vel0 = sample_init_1p(W, H, radius_eff, speed_max=args.speed_max, seed=args.seed)
+        vel0 = vel0.astype(np.float32)
+    elif args.fixed_vx is not None:
+        pos0, _ = sample_init_1p(W, H, radius_eff, speed_max=args.speed_max, seed=args.seed)
+        pos0 = pos0.astype(np.float32)
+        vel0 = np.array([[float(args.fixed_vx), float(args.fixed_vy)]], dtype=np.float32)
+    else:
+        pos0, vel0 = sample_init_1p(W, H, radius_eff, speed_max=args.speed_max, seed=args.seed)
+        pos0 = pos0.astype(np.float32)
+        vel0 = vel0.astype(np.float32)
+    pos0[0, 0] = np.clip(pos0[0, 0], radius_eff, W - radius_eff)
+    pos0[0, 1] = np.clip(pos0[0, 1], radius_eff, H - radius_eff)
 
     rng = np.random.default_rng(args.perturb_seed)
     def apply_perturbation(pos_arr, vel_arr):
@@ -170,6 +192,8 @@ def main():
         "perturb_step": int(args.perturb_step),
         "view_mode": args.view_mode,
         "frame_stride": int(args.frame_stride),
+        "initial_pos": [float(pos0[0, 0]), float(pos0[0, 1])],
+        "initial_vel": [float(vel0[0, 0]), float(vel0[0, 1])],
     }
     with open(out_dir / "gt_vs_gt_perturbed_summary_1p.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
