@@ -98,7 +98,17 @@ def animate_single_rollout_1p(pos, radius, W, H, dt, interval=20, title="Ground 
     return ani
 
 
-def animate_side_by_side_1p(pos_true, pos_pred, radius, W, H, dt, interval=20):
+def animate_side_by_side_1p(
+    pos_true,
+    pos_pred,
+    radius,
+    W,
+    H,
+    dt,
+    interval=20,
+    title_left="TRUE simulator",
+    title_right="NN rollout",
+):
     pos_true = np.asarray(pos_true, dtype=np.float32)
     pos_pred = np.asarray(pos_pred, dtype=np.float32)
     radius = float(radius)
@@ -106,7 +116,7 @@ def animate_side_by_side_1p(pos_true, pos_pred, radius, W, H, dt, interval=20):
     display_radius = max(radius, 0.015 * min(float(W), float(H)))
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
-    for ax, title in [(ax1, "TRUE simulator"), (ax2, "NN rollout")]:
+    for ax, title in [(ax1, title_left), (ax2, title_right)]:
         ax.set_xlim(0, W)
         ax.set_ylim(0, H)
         ax.set_aspect("equal")

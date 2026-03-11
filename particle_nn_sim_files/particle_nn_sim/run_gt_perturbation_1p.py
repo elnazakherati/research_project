@@ -130,6 +130,8 @@ def main():
             W=W,
             H=H,
             dt=dt_v,
+            title_left="Ground Truth",
+            title_right="Perturbed Ground Truth",
         )
         mp4_path = out_dir / "gt_vs_gt_perturbed_side_by_side_1p.mp4"
     save_animation_mp4(anim, str(mp4_path), fps=args.fps)
