@@ -40,6 +40,13 @@ def parse_args():
     p.add_argument("--fps", type=int, default=50)
     p.add_argument("--frame-stride", type=int, default=1, help="Use every k-th frame when rendering videos.")
     p.add_argument(
+        "--x-axis",
+        type=str,
+        default="steps",
+        choices=["steps", "time"],
+        help="X-axis for error plot.",
+    )
+    p.add_argument(
         "--view-mode",
         type=str,
         default="side_by_side",
@@ -137,12 +144,17 @@ def main():
 
     # Error curve
     pos_err = np.linalg.norm(pos_ref[:, 0, :] - pos_pert[:, 0, :], axis=1)
-    t = np.arange(len(pos_err), dtype=np.float32) * float(args.dt)
+    if args.x_axis == "time":
+        x_vals = np.arange(len(pos_err), dtype=np.float32) * float(args.dt)
+        x_label = "time (s)"
+    else:
+        x_vals = np.arange(len(pos_err), dtype=np.int32)
+        x_label = "step"
 
     err_plot = out_dir / "gt_vs_gt_perturbed_error_vs_time_1p.png"
     plt.figure(figsize=(7, 4))
-    plt.plot(t, pos_err, lw=2, color="tab:red")
-    plt.xlabel("time (s)")
+    plt.plot(x_vals, pos_err, lw=2, color="tab:red")
+    plt.xlabel(x_label)
     plt.ylabel("position error ||x_pert - x_ref||")
     plt.title("GT Sensitivity to Initial Gaussian Perturbation (1P)")
     plt.grid(True, alpha=0.3)
@@ -192,6 +204,7 @@ def main():
         "perturb_step": int(args.perturb_step),
         "view_mode": args.view_mode,
         "frame_stride": int(args.frame_stride),
+        "x_axis": args.x_axis,
         "initial_pos": [float(pos0[0, 0]), float(pos0[0, 1])],
         "initial_vel": [float(vel0[0, 0]), float(vel0[0, 1])],
     }
