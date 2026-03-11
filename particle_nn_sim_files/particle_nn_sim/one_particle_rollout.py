@@ -157,6 +157,63 @@ def animate_side_by_side_1p(pos_true, pos_pred, radius, W, H, dt, interval=20):
     return ani
 
 
+def animate_overlay_gt_perturbed_1p(
+    pos_ref,
+    pos_pert,
+    radius,
+    W,
+    H,
+    dt,
+    interval=20,
+    title="Ground Truth vs Perturbed Ground Truth",
+):
+    pos_ref = np.asarray(pos_ref, dtype=np.float32)
+    pos_pert = np.asarray(pos_pert, dtype=np.float32)
+    radius = float(radius)
+    dt = float(dt)
+    display_radius = max(radius, 0.015 * min(float(W), float(H)))
+
+    n_frames = min(len(pos_ref), len(pos_pert))
+
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    ax.set_xlim(0, W)
+    ax.set_ylim(0, H)
+    ax.set_aspect("equal")
+    ax.set_title(title)
+    ax.plot([0, W, W, 0, 0], [0, 0, H, H, 0], lw=2)
+
+    (trace_ref,) = ax.plot([], [], color="tab:green", lw=2.0, alpha=0.9, label="GT")
+    (trace_pert,) = ax.plot([], [], color="tab:orange", lw=2.0, alpha=0.35, label="GT (perturbed)")
+    c_ref = plt.Circle(pos_ref[0, 0], display_radius, color="tab:green", fill=True, alpha=0.9)
+    c_pert = plt.Circle(pos_pert[0, 0], display_radius, color="tab:orange", fill=True, alpha=0.35)
+    ax.add_patch(c_ref)
+    ax.add_patch(c_pert)
+    ax.legend(loc="upper right")
+
+    step_text = ax.text(
+        0.02,
+        0.98,
+        "",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+    )
+
+    def animate(frame):
+        trace_ref.set_data(pos_ref[: frame + 1, 0, 0], pos_ref[: frame + 1, 0, 1])
+        trace_pert.set_data(pos_pert[: frame + 1, 0, 0], pos_pert[: frame + 1, 0, 1])
+        c_ref.center = pos_ref[frame, 0]
+        c_pert.center = pos_pert[frame, 0]
+        step_text.set_text(f"t={frame * dt:.2f}s | step {frame}/{n_frames-1}")
+        return [trace_ref, trace_pert, c_ref, c_pert, step_text]
+
+    ani = animation.FuncAnimation(fig, animate, frames=n_frames, interval=interval, blit=True)
+    plt.close(fig)
+    return ani
+
+
 def save_animation_mp4(anim, out_path, fps=50):
     out_path = str(out_path)
     suffix = Path(out_path).suffix.lower()
