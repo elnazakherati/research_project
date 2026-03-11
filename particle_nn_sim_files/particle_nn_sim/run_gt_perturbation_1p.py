@@ -23,6 +23,12 @@ def parse_args():
     p.add_argument("--speed-max", type=float, default=0.7)
     p.add_argument("--sigma-pos", type=float, default=0.005, help="Std-dev Gaussian noise for initial position.")
     p.add_argument("--sigma-vel", type=float, default=0.0, help="Std-dev Gaussian noise for initial velocity.")
+    p.add_argument(
+        "--perturb-step",
+        type=int,
+        default=0,
+        help="Timestep at which perturbation is applied (0 means initial condition).",
+    )
     p.add_argument("--radius", type=float, default=0.0)
     p.add_argument("--mass", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=0)
@@ -42,6 +48,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.perturb_step < 0 or args.perturb_step > args.steps:
+        raise ValueError("--perturb-step must satisfy 0 <= perturb_step <= steps")
     if args.frame_stride < 1:
         raise ValueError("--frame-stride must be >= 1")
     out_dir = Path(args.out_dir)
@@ -56,16 +64,16 @@ def main():
     vel0 = vel0.astype(np.float32)
 
     rng = np.random.default_rng(args.perturb_seed)
-    pos0_pert = pos0.copy()
-    vel0_pert = vel0.copy()
-    if float(args.sigma_pos) > 0.0:
-        pos0_pert[0] += rng.normal(0.0, float(args.sigma_pos), size=(2,)).astype(np.float32)
-    if float(args.sigma_vel) > 0.0:
-        vel0_pert[0] += rng.normal(0.0, float(args.sigma_vel), size=(2,)).astype(np.float32)
-
-    # Keep perturbed particle inside the box.
-    pos0_pert[0, 0] = np.clip(pos0_pert[0, 0], radius_eff, W - radius_eff)
-    pos0_pert[0, 1] = np.clip(pos0_pert[0, 1], radius_eff, H - radius_eff)
+    def apply_perturbation(pos_arr, vel_arr):
+        out_pos = pos_arr.copy()
+        out_vel = vel_arr.copy()
+        if float(args.sigma_pos) > 0.0:
+            out_pos[0] += rng.normal(0.0, float(args.sigma_pos), size=(2,)).astype(np.float32)
+        if float(args.sigma_vel) > 0.0:
+            out_vel[0] += rng.normal(0.0, float(args.sigma_vel), size=(2,)).astype(np.float32)
+        out_pos[0, 0] = np.clip(out_pos[0, 0], radius_eff, W - radius_eff)
+        out_pos[0, 1] = np.clip(out_pos[0, 1], radius_eff, H - radius_eff)
+        return out_pos, out_vel
 
     sim_ref = ParticleSim2D(
         W=W,
@@ -85,10 +93,23 @@ def main():
     )
 
     sim_ref.reset(pos0, vel0)
-    sim_pert.reset(pos0_pert, vel0_pert)
+    sim_pert.reset(pos0, vel0)
 
     pos_ref, vel_ref = sim_ref.rollout(dt=args.dt, steps=args.steps)
-    pos_pert, vel_pert = sim_pert.rollout(dt=args.dt, steps=args.steps)
+
+    if args.perturb_step == 0:
+        p0, v0 = apply_perturbation(pos0, vel0)
+        sim_pert.reset(p0, v0)
+        pos_pert, vel_pert = sim_pert.rollout(dt=args.dt, steps=args.steps)
+    else:
+        pos_pre, vel_pre = sim_pert.rollout(dt=args.dt, steps=args.perturb_step)
+        p_now = sim_pert.pos.astype(np.float32)
+        v_now = sim_pert.vel.astype(np.float32)
+        p_now, v_now = apply_perturbation(p_now, v_now)
+        sim_pert.reset(p_now, v_now)
+        pos_post, vel_post = sim_pert.rollout(dt=args.dt, steps=args.steps - args.perturb_step)
+        pos_pert = np.concatenate([pos_pre, pos_post[1:]], axis=0)
+        vel_pert = np.concatenate([vel_pre, vel_post[1:]], axis=0)
     pos_ref = pos_ref.astype(np.float32)
     pos_pert = pos_pert.astype(np.float32)
 
@@ -146,6 +167,7 @@ def main():
         "dt": float(args.dt),
         "seed": int(args.seed),
         "perturb_seed": int(args.perturb_seed),
+        "perturb_step": int(args.perturb_step),
         "view_mode": args.view_mode,
         "frame_stride": int(args.frame_stride),
     }
