@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 
 from particle_nn_sim.one_particle_data import sample_init_1p
 from particle_nn_sim.one_particle_rollout import animate_overlay_gt_perturbed_1p, save_animation_mp4
+from particle_nn_sim.one_particle_rollout import animate_side_by_side_1p
 from particle_nn_sim.simulator import ParticleSim2D
 
 
@@ -27,12 +28,22 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--perturb-seed", type=int, default=123)
     p.add_argument("--fps", type=int, default=50)
+    p.add_argument("--frame-stride", type=int, default=1, help="Use every k-th frame when rendering videos.")
+    p.add_argument(
+        "--view-mode",
+        type=str,
+        default="side_by_side",
+        choices=["side_by_side", "overlay"],
+        help="Render style for GT vs perturbed visualization.",
+    )
     p.add_argument("--out-dir", type=str, default="checkpoints/one_particle_gt_perturbation")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.frame_stride < 1:
+        raise ValueError("--frame-stride must be >= 1")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -96,17 +107,31 @@ def main():
     plt.savefig(err_plot, dpi=150)
     plt.close()
 
-    # Overlay animation (same axis, perturbed is fainter)
-    anim = animate_overlay_gt_perturbed_1p(
-        pos_ref=pos_ref,
-        pos_pert=pos_pert,
-        radius=radius_eff,
-        W=W,
-        H=H,
-        dt=float(args.dt),
-        title="Ground Truth vs Perturbed Ground Truth (1P)",
-    )
-    mp4_path = out_dir / "gt_vs_gt_perturbed_overlay_1p.mp4"
+    pos_ref_v = pos_ref[:: args.frame_stride]
+    pos_pert_v = pos_pert[:: args.frame_stride]
+    dt_v = float(args.dt) * float(args.frame_stride)
+
+    if args.view_mode == "overlay":
+        anim = animate_overlay_gt_perturbed_1p(
+            pos_ref=pos_ref_v,
+            pos_pert=pos_pert_v,
+            radius=radius_eff,
+            W=W,
+            H=H,
+            dt=dt_v,
+            title="Ground Truth vs Perturbed Ground Truth (1P)",
+        )
+        mp4_path = out_dir / "gt_vs_gt_perturbed_overlay_1p.mp4"
+    else:
+        anim = animate_side_by_side_1p(
+            pos_true=pos_ref_v,
+            pos_pred=pos_pert_v,
+            radius=radius_eff,
+            W=W,
+            H=H,
+            dt=dt_v,
+        )
+        mp4_path = out_dir / "gt_vs_gt_perturbed_side_by_side_1p.mp4"
     save_animation_mp4(anim, str(mp4_path), fps=args.fps)
 
     summary = {
@@ -119,6 +144,8 @@ def main():
         "dt": float(args.dt),
         "seed": int(args.seed),
         "perturb_seed": int(args.perturb_seed),
+        "view_mode": args.view_mode,
+        "frame_stride": int(args.frame_stride),
     }
     with open(out_dir / "gt_vs_gt_perturbed_summary_1p.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -132,4 +159,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

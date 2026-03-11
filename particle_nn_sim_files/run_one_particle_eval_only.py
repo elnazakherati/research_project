@@ -12,10 +12,22 @@ from particle_nn_sim.models import ResMLP
 from particle_nn_sim.simulator import ParticleSim2D
 from particle_nn_sim.one_particle_data import sample_init_1p
 from particle_nn_sim.one_particle_rollout import (
+    animate_overlay_gt_perturbed_1p,
     animate_side_by_side_1p,
     nn_rollout_residual_1p,
     save_animation_mp4,
 )
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    val = str(v).strip().lower()
+    if val in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if val in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {v}")
 
 
 def parse_args():
@@ -25,6 +37,8 @@ def parse_args():
     p.add_argument("--rollout-steps", type=int, default=1000)
     p.add_argument("--speed-max", type=float, default=0.7)
     p.add_argument("--fps", type=int, default=50)
+    p.add_argument("--frame-stride", type=int, default=1, help="Use every k-th frame when rendering videos.")
+    p.add_argument("--save-overlay", type=str2bool, default=True, help="Also save single-axis GT/NN overlay video.")
     p.add_argument("--out-dir", type=str, default="checkpoints/one_particle_eval_only")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
@@ -41,6 +55,8 @@ def resolve_device(flag):
 
 def main():
     args = parse_args()
+    if args.frame_stride < 1:
+        raise ValueError("--frame-stride must be >= 1")
     rng = np.random.default_rng(args.seed)
 
     ckpt_path = Path(args.ckpt)
@@ -102,16 +118,34 @@ def main():
             dt=dt,
         )
 
+        pos_true_v = pos_true[:: args.frame_stride]
+        pos_pred_v = pos_pred[:: args.frame_stride]
+        dt_v = dt * float(args.frame_stride)
+
         anim = animate_side_by_side_1p(
-            pos_true=pos_true,
-            pos_pred=pos_pred,
+            pos_true=pos_true_v,
+            pos_pred=pos_pred_v,
             radius=radius,
             W=W,
             H=H,
-            dt=dt,
+            dt=dt_v,
         )
         out_mp4 = out_dir / f"rollout_{i:03d}_gt_vs_pred_1p.mp4"
         save_animation_mp4(anim, str(out_mp4), fps=args.fps)
+        overlay_name = ""
+        if args.save_overlay:
+            overlay_anim = animate_overlay_gt_perturbed_1p(
+                pos_ref=pos_true_v,
+                pos_pert=pos_pred_v,
+                radius=radius,
+                W=W,
+                H=H,
+                dt=dt_v,
+                title="GT vs NN rollout (same init)",
+            )
+            overlay_mp4 = out_dir / f"rollout_{i:03d}_gt_vs_pred_overlay_1p.mp4"
+            save_animation_mp4(overlay_anim, str(overlay_mp4), fps=args.fps)
+            overlay_name = overlay_mp4.name
 
         pos_err = np.linalg.norm(pos_true[:, 0, :] - pos_pred[:, 0, :], axis=1)
         plot_path = out_dir / f"rollout_{i:03d}_error_vs_step.png"
@@ -130,6 +164,7 @@ def main():
             f"max_err={float(np.max(pos_err)):.6f} "
             f"final_err={float(pos_err[-1]):.6f} | "
             f"plot={plot_path.name}"
+            + (f" | overlay={overlay_name}" if overlay_name else "")
         )
 
     print("Done.")
