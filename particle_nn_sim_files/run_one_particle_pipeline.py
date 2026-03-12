@@ -61,6 +61,12 @@ def parse_args():
 
     # Eval/output
     p.add_argument("--rollout-steps", type=int, default=1000)
+    p.add_argument(
+        "--divergence-threshold",
+        type=float,
+        default=0.3,
+        help="First step where rollout position error exceeds this value is divergence step (TTF).",
+    )
     p.add_argument("--fps", type=int, default=50)
     p.add_argument("--out-dir", type=str, default="checkpoints/one_particle_run")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
@@ -356,6 +362,8 @@ def train_multistep_1p(
 
 def main():
     args = parse_args()
+    if args.divergence_threshold < 0.0:
+        raise ValueError("--divergence-threshold must be >= 0")
     set_seed(args.seed)
     device = resolve_device(args.device)
     if device == "cuda":
@@ -376,6 +384,7 @@ def main():
             "collision_weight": args.collision_weight,
             "rebalance_sampling": args.rebalance_sampling,
             "target_collision_frac": args.target_collision_frac,
+            "divergence_threshold": args.divergence_threshold,
             "seed": args.seed,
         },
     )
@@ -576,6 +585,9 @@ def main():
 
     # Analysis metrics.
     pos_err = np.linalg.norm(pos_true[:, 0, :] - pos_pred[:, 0, :], axis=1)
+    div_idx = np.where(pos_err > float(args.divergence_threshold))[0]
+    diverged = bool(len(div_idx) > 0)
+    divergence_step = int(div_idx[0]) if diverged else int(args.rollout_steps)
     err_plot_path = out_dir / "error_vs_timestep_1p.png"
     plt.figure(figsize=(7, 4))
     plt.plot(np.arange(len(pos_err)), pos_err, lw=2, color="tab:red")
@@ -590,6 +602,9 @@ def main():
         "mean_position_error": float(np.mean(pos_err)),
         "max_position_error": float(np.max(pos_err)),
         "final_position_error": float(pos_err[-1]),
+        "diverged": diverged,
+        "divergence_step": int(divergence_step),
+        "divergence_threshold": float(args.divergence_threshold),
         "error_plot_path": str(err_plot_path),
         "test_stats": stats,
         "best_epoch": int(best["epoch"]),
@@ -632,6 +647,9 @@ def main():
         wandb_run.summary["mean_position_error"] = analysis["mean_position_error"]
         wandb_run.summary["max_position_error"] = analysis["max_position_error"]
         wandb_run.summary["final_position_error"] = analysis["final_position_error"]
+        wandb_run.summary["diverged"] = bool(analysis["diverged"])
+        wandb_run.summary["divergence_step"] = int(analysis["divergence_step"])
+        wandb_run.summary["divergence_threshold"] = float(analysis["divergence_threshold"])
         wandb_run.summary["final_test_mse_all"] = stats["mse_all"]
         wandb_run.summary["final_test_mse_collision"] = stats["mse_collision"]
         wandb_run.summary["final_test_mse_noncollision"] = stats["mse_noncollision"]
