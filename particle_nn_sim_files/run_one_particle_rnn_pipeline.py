@@ -197,6 +197,10 @@ def make_weighted_sampler(binary_labels, target_collision_frac):
 def rnn_rollout_1p(model, pos0, vel0, radius, mass, steps, x_mean, x_std, y_mean, y_std, device):
     model.eval()
     steps = int(steps)
+    x_mean = np.asarray(x_mean, dtype=np.float32).reshape(-1)
+    x_std = np.asarray(x_std, dtype=np.float32).reshape(-1)
+    y_mean = np.asarray(y_mean, dtype=np.float32).reshape(-1)
+    y_std = np.asarray(y_std, dtype=np.float32).reshape(-1)
     pos_pred = np.zeros((steps + 1, 1, 2), dtype=np.float32)
     vel_pred = np.zeros((steps + 1, 1, 2), dtype=np.float32)
     pos_pred[0] = pos0.astype(np.float32)
@@ -576,4 +580,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
