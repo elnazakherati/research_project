@@ -22,6 +22,7 @@ from particle_nn_sim.one_particle_rollout import (
     nn_rollout_residual_1p,
     save_animation_mp4,
 )
+from particle_nn_sim.losses import reflection_aware_loss_2d, reflection_aware_loss_2d_softmin
 
 
 def str2bool(v):
@@ -55,6 +56,14 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--collision-weight", type=float, default=10.0)
+    p.add_argument("--loss-type", type=str, default="mse", choices=["mse", "reflection_hard", "reflection_soft"])
+    p.add_argument(
+        "--reflection-K",
+        type=int,
+        default=1,
+        help="Mirror index range in {-K,...,K}. K=1 is a practical default when predictions are near the correct branch.",
+    )
+    p.add_argument("--reflection-softmin-tau", type=float, default=0.05)
     p.add_argument("--multistep-horizon", type=int, default=10)
     p.add_argument("--rebalance-sampling", type=str2bool, default=True)
     p.add_argument("--target-collision-frac", type=float, default=0.3)
@@ -188,6 +197,11 @@ def train_multistep_1p(
     dt,
     radius,
     mass,
+    box_Lx,
+    box_Ly,
+    loss_type,
+    reflection_k,
+    reflection_softmin_tau,
     wandb_run=None,
 ):
     model.to(device)
@@ -202,11 +216,48 @@ def train_multistep_1p(
     m_t = float(mass)
     cw = float(collision_weight)
 
-    history = {"train_loss": [], "test_mse_all": [], "test_mse_collision": [], "test_mse_noncollision": []}
+    history = {
+        "train_objective": [],
+        "train_loss": [],
+        "test_objective_all": [],
+        "test_objective_collision": [],
+        "test_objective_noncollision": [],
+        "test_mse_all": [],
+        "test_mse_collision": [],
+        "test_mse_noncollision": [],
+    }
     best = {"epoch": -1, "mse_all": float("inf"), "state_dict": None, "stats": None}
+
+    def per_sample_objective(pred_state, gt_state):
+        if loss_type == "mse":
+            return ((pred_state - gt_state) ** 2).mean(dim=1)
+        if loss_type == "reflection_hard":
+            return reflection_aware_loss_2d(
+                pred_state,
+                gt_state,
+                Lx=box_Lx,
+                Ly=box_Ly,
+                K=reflection_k,
+                reduction="none",
+            )
+        if loss_type == "reflection_soft":
+            return reflection_aware_loss_2d_softmin(
+                pred_state,
+                gt_state,
+                Lx=box_Lx,
+                Ly=box_Ly,
+                K=reflection_k,
+                tau=reflection_softmin_tau,
+                reduction="none",
+            )
+        raise ValueError(f"Unknown loss_type={loss_type}")
 
     def eval_loader(loader):
         model.eval()
+        obj_all_sum = 0.0
+        obj_col_sum = 0.0
+        obj_non_sum = 0.0
+        n_obj_all = n_obj_col = n_obj_non = 0
         mse_all_sum = 0.0
         mse_col_sum = 0.0
         mse_non_sum = 0.0
@@ -219,6 +270,7 @@ def train_multistep_1p(
 
                 B, H, _ = future_gt.shape
                 state = state0
+                per_step_obj = []
                 per_step_mse = []
                 per_step_coll = []
                 for k in range(H):
@@ -241,25 +293,37 @@ def train_multistep_1p(
                     state = state_free + resid
 
                     gt_k = future_gt[:, k, :]
+                    obj_k = per_sample_objective(state, gt_k)  # (B,)
                     mse_k = ((state - gt_k) ** 2).mean(dim=1)  # (B,)
+                    per_step_obj.append(obj_k)
                     per_step_mse.append(mse_k)
                     per_step_coll.append(coll_future[:, k])
 
+                obj = torch.stack(per_step_obj, dim=1)  # (B,H)
                 mse = torch.stack(per_step_mse, dim=1)  # (B,H)
                 coll = torch.stack(per_step_coll, dim=1)  # (B,H)
                 non = ~coll
 
+                obj_all_sum += obj.sum().item()
+                n_obj_all += obj.numel()
                 mse_all_sum += mse.sum().item()
                 n_all += mse.numel()
 
                 if coll.any():
+                    obj_col_sum += obj[coll].sum().item()
+                    n_obj_col += int(coll.sum().item())
                     mse_col_sum += mse[coll].sum().item()
                     n_col += int(coll.sum().item())
                 if non.any():
+                    obj_non_sum += obj[non].sum().item()
+                    n_obj_non += int(non.sum().item())
                     mse_non_sum += mse[non].sum().item()
                     n_non += int(non.sum().item())
 
         return {
+            "objective_all": obj_all_sum / max(n_obj_all, 1),
+            "objective_collision": obj_col_sum / max(n_obj_col, 1),
+            "objective_noncollision": obj_non_sum / max(n_obj_non, 1),
             "mse_all": mse_all_sum / max(n_all, 1),
             "mse_collision": mse_col_sum / max(n_col, 1),
             "mse_noncollision": mse_non_sum / max(n_non, 1),
@@ -271,7 +335,7 @@ def train_multistep_1p(
     for ep in range(1, int(epochs) + 1):
         t0 = time.time()
         model.train()
-        running = 0.0
+        running_obj = 0.0
         n_samples = 0
 
         for state0, future_gt, coll_future in train_loader:
@@ -302,24 +366,28 @@ def train_multistep_1p(
                 state = state_free + resid
 
                 gt_k = future_gt[:, k, :]
-                mse_k = ((state - gt_k) ** 2).mean(dim=1)  # (B,)
+                obj_k = per_sample_objective(state, gt_k)  # (B,)
                 if cw != 1.0:
-                    w = torch.where(coll_future[:, k] > 0, torch.full_like(mse_k, cw), torch.ones_like(mse_k))
-                    mse_k = w * mse_k
-                step_losses.append(mse_k.mean())
+                    w = torch.where(coll_future[:, k] > 0, torch.full_like(obj_k, cw), torch.ones_like(obj_k))
+                    obj_k = w * obj_k
+                step_losses.append(obj_k.mean())
 
-            loss = torch.stack(step_losses).mean()
+            objective = torch.stack(step_losses).mean()
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            objective.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
 
-            running += loss.item() * B
+            running_obj += objective.item() * B
             n_samples += B
 
-        train_loss = running / max(n_samples, 1)
+        train_objective = running_obj / max(n_samples, 1)
         stats = eval_loader(test_loader)
-        history["train_loss"].append(train_loss)
+        history["train_objective"].append(train_objective)
+        history["train_loss"].append(train_objective)
+        history["test_objective_all"].append(stats["objective_all"])
+        history["test_objective_collision"].append(stats["objective_collision"])
+        history["test_objective_noncollision"].append(stats["objective_noncollision"])
         history["test_mse_all"].append(stats["mse_all"])
         history["test_mse_collision"].append(stats["mse_collision"])
         history["test_mse_noncollision"].append(stats["mse_noncollision"])
@@ -332,7 +400,8 @@ def train_multistep_1p(
         epoch_sec = time.time() - t0
 
         print(
-            f"Epoch {ep:03d} | train_loss={train_loss:.6f} "
+            f"Epoch {ep:03d} | train_objective={train_objective:.6f} "
+            f"| test_objective={stats['objective_all']:.6f} "
             f"| test_mse={stats['mse_all']:.6f} "
             f"| test_collision={stats['mse_collision']:.6f} "
             f"| test_noncollision={stats['mse_noncollision']:.6f} "
@@ -343,7 +412,11 @@ def train_multistep_1p(
             wandb_run.log(
                 {
                     "epoch": ep,
-                    "train_loss": train_loss,
+                    "train_objective": train_objective,
+                    "test_objective_all": stats["objective_all"],
+                    "test_objective_collision": stats["objective_collision"],
+                    "test_objective_noncollision": stats["objective_noncollision"],
+                    "train_loss": train_objective,
                     "test_mse_all": stats["mse_all"],
                     "test_mse_collision": stats["mse_collision"],
                     "test_mse_noncollision": stats["mse_noncollision"],
@@ -364,6 +437,10 @@ def main():
     args = parse_args()
     if args.divergence_threshold < 0.0:
         raise ValueError("--divergence-threshold must be >= 0")
+    if args.reflection_K < 0:
+        raise ValueError("--reflection-K must be >= 0")
+    if args.reflection_softmin_tau <= 0.0:
+        raise ValueError("--reflection-softmin-tau must be > 0")
     set_seed(args.seed)
     device = resolve_device(args.device)
     if device == "cuda":
@@ -381,6 +458,9 @@ def main():
             "epochs": args.epochs,
             "batch_size": args.batch_size,
             "multistep_horizon": args.multistep_horizon,
+            "loss_type": args.loss_type,
+            "reflection_K": args.reflection_K,
+            "reflection_softmin_tau": args.reflection_softmin_tau,
             "collision_weight": args.collision_weight,
             "rebalance_sampling": args.rebalance_sampling,
             "target_collision_frac": args.target_collision_frac,
@@ -536,6 +616,11 @@ def main():
         dt=float(meta["dt"]),
         radius=float(meta["radii"][0]),
         mass=float(meta["masses"][0]),
+        box_Lx=float(meta["W"]),
+        box_Ly=float(meta["H"]),
+        loss_type=args.loss_type,
+        reflection_k=args.reflection_K,
+        reflection_softmin_tau=args.reflection_softmin_tau,
         wandb_run=wandb_run,
     )
 
@@ -650,6 +735,9 @@ def main():
         wandb_run.summary["diverged"] = bool(analysis["diverged"])
         wandb_run.summary["divergence_step"] = int(analysis["divergence_step"])
         wandb_run.summary["divergence_threshold"] = float(analysis["divergence_threshold"])
+        wandb_run.summary["final_test_objective_all"] = stats["objective_all"]
+        wandb_run.summary["final_test_objective_collision"] = stats["objective_collision"]
+        wandb_run.summary["final_test_objective_noncollision"] = stats["objective_noncollision"]
         wandb_run.summary["final_test_mse_all"] = stats["mse_all"]
         wandb_run.summary["final_test_mse_collision"] = stats["mse_collision"]
         wandb_run.summary["final_test_mse_noncollision"] = stats["mse_noncollision"]
