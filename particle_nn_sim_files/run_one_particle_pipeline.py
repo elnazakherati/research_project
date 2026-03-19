@@ -46,6 +46,13 @@ def parse_args():
     p.add_argument("--train-split", type=float, default=0.8)
     p.add_argument("--radius", type=float, default=0.0)
     p.add_argument("--mass", type=float, default=1.0)
+    p.add_argument(
+        "--wall-collision-mode",
+        type=str,
+        default="clamp",
+        choices=["clamp", "exact"],
+        help="Ground-truth wall handling mode for simulator-generated trajectories.",
+    )
 
     # Model/train
     p.add_argument("--hidden", type=int, default=128)
@@ -378,6 +385,7 @@ def main():
             "episodes": args.episodes,
             "steps": args.steps,
             "dt": args.dt,
+            "wall_collision_mode": args.wall_collision_mode,
             "epochs": args.epochs,
             "batch_size": args.batch_size,
             "multistep_horizon": args.multistep_horizon,
@@ -402,6 +410,7 @@ def main():
         masses=[args.mass],
         restitution=1.0,
         seed=args.seed,
+        wall_mode=args.wall_collision_mode,
     )
 
     pos_all, vel_all, coll_all, meta = collect_episodes_1p(
@@ -551,6 +560,7 @@ def main():
         masses=np.asarray(meta["masses"], dtype=float),
         restitution=float(meta["restitution"]),
         seed=args.seed + 123,
+        wall_mode=args.wall_collision_mode,
     )
     sim_true.reset(pos0, vel0)
     pos_true, vel_true = sim_true.rollout(dt=float(meta["dt"]), steps=args.rollout_steps)

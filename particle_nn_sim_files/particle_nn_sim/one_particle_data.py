@@ -57,6 +57,7 @@ def collect_episodes_1p(sim, E=300, steps=1000, dt=0.01, speed_max=0.7, seed=0):
         "radii": sim.radii.astype(np.float32),
         "masses": sim.masses.astype(np.float32),
         "restitution": np.float32(sim.restitution),
+        "wall_mode": str(getattr(sim, "wall_mode", "clamp")),
     }
     return pos_all, vel_all, coll_all, meta
 

@@ -50,6 +50,13 @@ def parse_args():
     p.add_argument("--out-dir", type=str, default="checkpoints/one_particle_eval_only")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    p.add_argument(
+        "--wall-collision-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "clamp", "exact"],
+        help="Ground-truth simulator wall mode. auto uses checkpoint/meta mode when available, else clamp.",
+    )
     return p.parse_args()
 
 
@@ -95,6 +102,10 @@ def main():
     radius = float(np.asarray(meta["radii"], dtype=np.float32)[0])
     mass = float(np.asarray(meta["masses"], dtype=np.float32)[0])
     restitution = float(meta["restitution"])
+    if args.wall_collision_mode == "auto":
+        wall_mode = str(meta.get("wall_mode", "clamp"))
+    else:
+        wall_mode = args.wall_collision_mode
 
     rollout_rows = []
 
@@ -109,6 +120,7 @@ def main():
             masses=[mass],
             restitution=restitution,
             seed=seed_i + 1,
+            wall_mode=wall_mode,
         )
         sim_true.reset(pos0, vel0)
         pos_true, vel_true = sim_true.rollout(dt=dt, steps=args.rollout_steps)

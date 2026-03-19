@@ -31,6 +31,13 @@ def parse_args():
     )
     p.add_argument("--radius", type=float, default=0.0)
     p.add_argument("--mass", type=float, default=1.0)
+    p.add_argument(
+        "--wall-collision-mode",
+        type=str,
+        default="clamp",
+        choices=["clamp", "exact"],
+        help="Ground-truth wall handling mode.",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--perturb-seed", type=int, default=123)
     p.add_argument("--fixed-x", type=float, default=None, help="Optional fixed initial x position.")
@@ -111,6 +118,7 @@ def main():
         masses=[args.mass],
         restitution=1.0,
         seed=args.seed,
+        wall_mode=args.wall_collision_mode,
     )
     sim_pert = ParticleSim2D(
         W=W,
@@ -119,6 +127,7 @@ def main():
         masses=[args.mass],
         restitution=1.0,
         seed=args.seed,
+        wall_mode=args.wall_collision_mode,
     )
 
     sim_ref.reset(pos0, vel0)

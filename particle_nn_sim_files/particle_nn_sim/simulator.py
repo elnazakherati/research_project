@@ -10,11 +10,27 @@ class ParticleSim2D:
       vel: (N,2)
     """
 
-    def __init__(self, W=1.0, H=1.0, radii=None, masses=None, restitution=1.0, seed=0):
+    def __init__(
+        self,
+        W=1.0,
+        H=1.0,
+        radii=None,
+        masses=None,
+        restitution=1.0,
+        seed=0,
+        wall_mode="clamp",
+        exact_max_events=16,
+    ):
         self.W = float(W)
         self.H = float(H)
         self.restitution = float(restitution)  # 1.0 = perfectly elastic
         self.rng = np.random.default_rng(seed)
+        self.wall_mode = str(wall_mode).strip().lower()
+        if self.wall_mode not in {"clamp", "exact"}:
+            raise ValueError(f"wall_mode must be 'clamp' or 'exact', got {wall_mode}")
+        self.exact_max_events = int(exact_max_events)
+        if self.exact_max_events < 1:
+            raise ValueError(f"exact_max_events must be >= 1, got {exact_max_events}")
 
         self.radii = np.array(radii, dtype=float) if radii is not None else None
         self.masses = np.array(masses, dtype=float) if masses is not None else None
@@ -49,7 +65,89 @@ class ParticleSim2D:
             "masses": self.masses.copy(),
             "W": self.W,
             "H": self.H,
+            "wall_mode": self.wall_mode,
         }
+
+    def _step_exact_1p(self, dt):
+        """Event-driven wall reflection for one particle (no pair collisions)."""
+        eps = 1e-12
+        t_rem = float(dt)
+        x = float(self.pos[0, 0])
+        y = float(self.pos[0, 1])
+        vx = float(self.vel[0, 0])
+        vy = float(self.vel[0, 1])
+        r = float(self.radii[0])
+
+        x_lo, x_hi = r, self.W - r
+        y_lo, y_hi = r, self.H - r
+
+        n_events = 0
+        while t_rem > eps:
+            # Candidate times to next wall along each axis.
+            if abs(vx) <= eps:
+                tx = np.inf
+            elif vx > 0.0:
+                tx = (x_hi - x) / vx
+            else:
+                tx = (x_lo - x) / vx
+
+            if abs(vy) <= eps:
+                ty = np.inf
+            elif vy > 0.0:
+                ty = (y_hi - y) / vy
+            else:
+                ty = (y_lo - y) / vy
+
+            if tx < -eps or ty < -eps:
+                # Numerical fallback: clamp and continue with no event.
+                x = min(max(x, x_lo), x_hi)
+                y = min(max(y, y_lo), y_hi)
+                x += vx * t_rem
+                y += vy * t_rem
+                t_rem = 0.0
+                break
+
+            t_hit = min(tx, ty)
+            if not np.isfinite(t_hit) or t_hit > t_rem:
+                # No wall event within remaining time: advance fully.
+                x += vx * t_rem
+                y += vy * t_rem
+                t_rem = 0.0
+                break
+
+            # Advance exactly to first wall event.
+            t_adv = max(0.0, t_hit)
+            x += vx * t_adv
+            y += vy * t_adv
+            t_rem -= t_adv
+
+            # Corner hit: flip both if both times coincide (within eps).
+            hit_x = abs(tx - t_hit) <= 1e-10
+            hit_y = abs(ty - t_hit) <= 1e-10
+            if hit_x:
+                vx = -vx
+            if hit_y:
+                vy = -vy
+
+            # Keep on-wall values numerically stable.
+            x = min(max(x, x_lo), x_hi)
+            y = min(max(y, y_lo), y_hi)
+
+            n_events += 1
+            if n_events >= self.exact_max_events:
+                # Safety fallback to avoid pathological event loops.
+                x += vx * t_rem
+                y += vy * t_rem
+                t_rem = 0.0
+                break
+
+        # Final clamp for numerical safety.
+        x = min(max(x, x_lo), x_hi)
+        y = min(max(y, y_lo), y_hi)
+        self.pos[0, 0] = x
+        self.pos[0, 1] = y
+        self.vel[0, 0] = vx
+        self.vel[0, 1] = vy
 
     def _handle_wall_collisions(self):
         # Left / right walls
@@ -140,14 +238,18 @@ class ParticleSim2D:
 
     def step(self, dt):
         dt = float(dt)
-        self.pos += self.vel * dt
+        if self.wall_mode == "exact" and self.pos.shape[0] == 1:
+            # Event-driven exact wall reflections for 1-particle case.
+            self._step_exact_1p(dt)
+        else:
+            self.pos += self.vel * dt
 
-        # Handle wall collisions then pair collisions
-        self._handle_wall_collisions()
-        self._handle_pair_collisions()
+            # Handle wall collisions then pair collisions
+            self._handle_wall_collisions()
+            self._handle_pair_collisions()
 
-        # Clamp again in case pair correction pushed outside
-        self._handle_wall_collisions()
+            # Clamp again in case pair correction pushed outside
+            self._handle_wall_collisions()
         return self.state()
 
     def kinetic_energy(self):
