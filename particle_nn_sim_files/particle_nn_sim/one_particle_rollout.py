@@ -19,10 +19,21 @@ def nn_rollout_residual_1p(
     y_std,
     device,
     dt,
+    enforce_box=False,
+    W=None,
+    H=None,
 ):
     model.eval()
     steps = int(steps)
     dt = float(dt)
+    enforce_box = bool(enforce_box)
+    if enforce_box:
+        if W is None or H is None:
+            raise ValueError("W and H must be provided when enforce_box=True")
+        W = float(W)
+        H = float(H)
+        if W <= 0.0 or H <= 0.0:
+            raise ValueError(f"W and H must be positive, got W={W}, H={H}")
 
     pos_pred = np.zeros((steps + 1, 1, 2), dtype=np.float32)
     vel_pred = np.zeros((steps + 1, 1, 2), dtype=np.float32)
@@ -31,6 +42,20 @@ def nn_rollout_residual_1p(
 
     pos_t = pos_pred[0, 0].copy()
     vel_t = vel_pred[0, 0].copy()
+
+    def _reflect_axis(p, v, L):
+        # Map unfolded coordinate p back into [0, L] and flip velocity sign on odd reflections.
+        u = p / L
+        q = np.floor(u)
+        r = u - q
+        q_int = int(q)
+        if q_int % 2 == 0:
+            p_fold = r * L
+            sgn = 1.0
+        else:
+            p_fold = (1.0 - r) * L
+            sgn = -1.0
+        return np.float32(p_fold), np.float32(v * sgn)
 
     for t in range(steps):
         x_raw = np.array(
@@ -50,6 +75,9 @@ def nn_rollout_residual_1p(
 
         pos_t = y_next[0:2]
         vel_t = y_next[2:4]
+        if enforce_box:
+            pos_t[0], vel_t[0] = _reflect_axis(float(pos_t[0]), float(vel_t[0]), W)
+            pos_t[1], vel_t[1] = _reflect_axis(float(pos_t[1]), float(vel_t[1]), H)
 
         pos_pred[t + 1, 0] = pos_t
         vel_pred[t + 1, 0] = vel_t

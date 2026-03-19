@@ -67,6 +67,18 @@ def parse_args():
     p.add_argument("--multistep-horizon", type=int, default=10)
     p.add_argument("--rebalance-sampling", type=str2bool, default=True)
     p.add_argument("--target-collision-frac", type=float, default=0.3)
+    p.add_argument(
+        "--box-penalty-weight",
+        type=float,
+        default=0.0,
+        help="Penalty weight for NN predictions leaving [0,W]x[0,H] during training objective.",
+    )
+    p.add_argument(
+        "--enforce-rollout-box",
+        type=str2bool,
+        default=False,
+        help="If true, fold NN rollout back into box by geometric reflection each step.",
+    )
 
     # Eval/output
     p.add_argument("--rollout-steps", type=int, default=1000)
@@ -202,6 +214,7 @@ def train_multistep_1p(
     loss_type,
     reflection_k,
     reflection_softmin_tau,
+    box_penalty_weight,
     wandb_run=None,
 ):
     model.to(device)
@@ -215,6 +228,7 @@ def train_multistep_1p(
     r_t = float(radius)
     m_t = float(mass)
     cw = float(collision_weight)
+    box_pen_w = float(box_penalty_weight)
 
     history = {
         "train_objective": [],
@@ -251,6 +265,13 @@ def train_multistep_1p(
                 reduction="none",
             )
         raise ValueError(f"Unknown loss_type={loss_type}")
+
+    def per_sample_box_penalty(pred_state):
+        # Penalize coordinates outside [0,W]x[0,H].
+        pos = pred_state[:, :2]
+        px = torch.relu(-pos[:, 0]) + torch.relu(pos[:, 0] - float(box_Lx))
+        py = torch.relu(-pos[:, 1]) + torch.relu(pos[:, 1] - float(box_Ly))
+        return px * px + py * py
 
     def eval_loader(loader):
         model.eval()
@@ -294,6 +315,8 @@ def train_multistep_1p(
 
                     gt_k = future_gt[:, k, :]
                     obj_k = per_sample_objective(state, gt_k)  # (B,)
+                    if box_pen_w > 0.0:
+                        obj_k = obj_k + (box_pen_w * per_sample_box_penalty(state))
                     mse_k = ((state - gt_k) ** 2).mean(dim=1)  # (B,)
                     per_step_obj.append(obj_k)
                     per_step_mse.append(mse_k)
@@ -366,10 +389,18 @@ def train_multistep_1p(
                 state = state_free + resid
 
                 gt_k = future_gt[:, k, :]
-                obj_k = per_sample_objective(state, gt_k)  # (B,)
+                base_k = per_sample_objective(state, gt_k)  # (B,)
                 if cw != 1.0:
-                    w = torch.where(coll_future[:, k] > 0, torch.full_like(obj_k, cw), torch.ones_like(obj_k))
-                    obj_k = w * obj_k
+                    w = torch.where(
+                        coll_future[:, k] > 0,
+                        torch.full_like(base_k, cw),
+                        torch.ones_like(base_k),
+                    )
+                    base_k = w * base_k
+                if box_pen_w > 0.0:
+                    obj_k = base_k + (box_pen_w * per_sample_box_penalty(state))
+                else:
+                    obj_k = base_k
                 step_losses.append(obj_k.mean())
 
             objective = torch.stack(step_losses).mean()
@@ -441,6 +472,8 @@ def main():
         raise ValueError("--reflection-K must be >= 0")
     if args.reflection_softmin_tau <= 0.0:
         raise ValueError("--reflection-softmin-tau must be > 0")
+    if args.box_penalty_weight < 0.0:
+        raise ValueError("--box-penalty-weight must be >= 0")
     set_seed(args.seed)
     device = resolve_device(args.device)
     if device == "cuda":
@@ -462,6 +495,8 @@ def main():
             "reflection_K": args.reflection_K,
             "reflection_softmin_tau": args.reflection_softmin_tau,
             "collision_weight": args.collision_weight,
+            "box_penalty_weight": args.box_penalty_weight,
+            "enforce_rollout_box": args.enforce_rollout_box,
             "rebalance_sampling": args.rebalance_sampling,
             "target_collision_frac": args.target_collision_frac,
             "divergence_threshold": args.divergence_threshold,
@@ -621,6 +656,7 @@ def main():
         loss_type=args.loss_type,
         reflection_k=args.reflection_K,
         reflection_softmin_tau=args.reflection_softmin_tau,
+        box_penalty_weight=args.box_penalty_weight,
         wandb_run=wandb_run,
     )
 
@@ -655,6 +691,9 @@ def main():
         y_std=y_std,
         device=device,
         dt=float(meta["dt"]),
+        enforce_box=args.enforce_rollout_box,
+        W=float(meta["W"]),
+        H=float(meta["H"]),
     )
 
     # Save GT-vs-pred animation.

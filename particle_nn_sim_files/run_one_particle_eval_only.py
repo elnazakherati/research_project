@@ -50,6 +50,12 @@ def parse_args():
     p.add_argument("--out-dir", type=str, default="checkpoints/one_particle_eval_only")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    p.add_argument(
+        "--enforce-rollout-box",
+        type=str2bool,
+        default=False,
+        help="If true, fold NN rollout back into box by geometric reflection each step.",
+    )
     return p.parse_args()
 
 
@@ -128,6 +134,9 @@ def main():
             y_std=y_std,
             device=device,
             dt=dt,
+            enforce_box=args.enforce_rollout_box,
+            W=W,
+            H=H,
         )
 
         pos_err = np.linalg.norm(pos_true[:, 0, :] - pos_pred[:, 0, :], axis=1)
