@@ -68,6 +68,18 @@ def parse_args():
     p.add_argument("--rebalance-sampling", type=str2bool, default=True)
     p.add_argument("--target-collision-frac", type=float, default=0.3)
     p.add_argument(
+        "--dv-penalty-weight",
+        type=float,
+        default=0.0,
+        help="Non-collision free-flight penalty weight for ||v_{t+1}-v_t||^2.",
+    )
+    p.add_argument(
+        "--speed-penalty-weight",
+        type=float,
+        default=0.0,
+        help="Non-collision speed-magnitude penalty weight for (||v_{t+1}||-||v_t||)^2.",
+    )
+    p.add_argument(
         "--box-penalty-weight",
         type=float,
         default=0.0,
@@ -215,6 +227,8 @@ def train_multistep_1p(
     reflection_k,
     reflection_softmin_tau,
     box_penalty_weight,
+    dv_penalty_weight,
+    speed_penalty_weight,
     wandb_run=None,
 ):
     model.to(device)
@@ -229,6 +243,8 @@ def train_multistep_1p(
     m_t = float(mass)
     cw = float(collision_weight)
     box_pen_w = float(box_penalty_weight)
+    dv_pen_w = float(dv_penalty_weight)
+    speed_pen_w = float(speed_penalty_weight)
 
     history = {
         "train_objective": [],
@@ -295,6 +311,7 @@ def train_multistep_1p(
                 per_step_mse = []
                 per_step_coll = []
                 for k in range(H):
+                    vel_prev = state[:, 2:4]
                     x_raw = torch.cat(
                         [
                             state,
@@ -315,6 +332,17 @@ def train_multistep_1p(
 
                     gt_k = future_gt[:, k, :]
                     obj_k = per_sample_objective(state, gt_k)  # (B,)
+                    coll_k = coll_future[:, k].float()
+                    non_k = 1.0 - coll_k
+                    vel_next = state[:, 2:4]
+                    if dv_pen_w > 0.0:
+                        dv_k = ((vel_next - vel_prev) ** 2).mean(dim=1)  # (B,)
+                        obj_k = obj_k + (dv_pen_w * non_k * dv_k)
+                    if speed_pen_w > 0.0:
+                        speed_prev = torch.linalg.norm(vel_prev, dim=1)
+                        speed_next = torch.linalg.norm(vel_next, dim=1)
+                        ds_k = (speed_next - speed_prev) ** 2
+                        obj_k = obj_k + (speed_pen_w * non_k * ds_k)
                     if box_pen_w > 0.0:
                         obj_k = obj_k + (box_pen_w * per_sample_box_penalty(state))
                     mse_k = ((state - gt_k) ** 2).mean(dim=1)  # (B,)
@@ -370,6 +398,7 @@ def train_multistep_1p(
             state = state0
             step_losses = []
             for k in range(H):
+                vel_prev = state[:, 2:4]
                 x_raw = torch.cat(
                     [
                         state,
@@ -390,13 +419,24 @@ def train_multistep_1p(
 
                 gt_k = future_gt[:, k, :]
                 base_k = per_sample_objective(state, gt_k)  # (B,)
+                coll_k = coll_future[:, k]
+                non_k = 1.0 - coll_k
+                vel_next = state[:, 2:4]
                 if cw != 1.0:
                     w = torch.where(
-                        coll_future[:, k] > 0,
+                        coll_k > 0,
                         torch.full_like(base_k, cw),
                         torch.ones_like(base_k),
                     )
                     base_k = w * base_k
+                if dv_pen_w > 0.0:
+                    dv_k = ((vel_next - vel_prev) ** 2).mean(dim=1)  # (B,)
+                    base_k = base_k + (dv_pen_w * non_k * dv_k)
+                if speed_pen_w > 0.0:
+                    speed_prev = torch.linalg.norm(vel_prev, dim=1)
+                    speed_next = torch.linalg.norm(vel_next, dim=1)
+                    ds_k = (speed_next - speed_prev) ** 2
+                    base_k = base_k + (speed_pen_w * non_k * ds_k)
                 if box_pen_w > 0.0:
                     obj_k = base_k + (box_pen_w * per_sample_box_penalty(state))
                 else:
@@ -472,6 +512,10 @@ def main():
         raise ValueError("--reflection-K must be >= 0")
     if args.reflection_softmin_tau <= 0.0:
         raise ValueError("--reflection-softmin-tau must be > 0")
+    if args.dv_penalty_weight < 0.0:
+        raise ValueError("--dv-penalty-weight must be >= 0")
+    if args.speed_penalty_weight < 0.0:
+        raise ValueError("--speed-penalty-weight must be >= 0")
     if args.box_penalty_weight < 0.0:
         raise ValueError("--box-penalty-weight must be >= 0")
     set_seed(args.seed)
@@ -495,6 +539,8 @@ def main():
             "reflection_K": args.reflection_K,
             "reflection_softmin_tau": args.reflection_softmin_tau,
             "collision_weight": args.collision_weight,
+            "dv_penalty_weight": args.dv_penalty_weight,
+            "speed_penalty_weight": args.speed_penalty_weight,
             "box_penalty_weight": args.box_penalty_weight,
             "enforce_rollout_box": args.enforce_rollout_box,
             "rebalance_sampling": args.rebalance_sampling,
@@ -657,6 +703,8 @@ def main():
         reflection_k=args.reflection_K,
         reflection_softmin_tau=args.reflection_softmin_tau,
         box_penalty_weight=args.box_penalty_weight,
+        dv_penalty_weight=args.dv_penalty_weight,
+        speed_penalty_weight=args.speed_penalty_weight,
         wandb_run=wandb_run,
     )
 
