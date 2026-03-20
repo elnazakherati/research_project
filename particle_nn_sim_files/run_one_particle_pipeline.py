@@ -43,9 +43,29 @@ def parse_args():
     p.add_argument("--steps", type=int, default=1000)
     p.add_argument("--dt", type=float, default=0.01)
     p.add_argument("--speed-max", type=float, default=0.7)
+    p.add_argument(
+        "--fixed-speed",
+        type=float,
+        default=None,
+        help="If set, sample all initial velocities with this fixed speed magnitude.",
+    )
     p.add_argument("--train-split", type=float, default=0.8)
     p.add_argument("--radius", type=float, default=0.0)
     p.add_argument("--mass", type=float, default=1.0)
+    p.add_argument(
+        "--stratified-init",
+        type=str2bool,
+        default=False,
+        help="Use stratified initial-condition sampling over position cells and angle bins.",
+    )
+    p.add_argument("--pos-grid-n", type=int, default=4, help="Position grid size N for NxN cells.")
+    p.add_argument("--angle-bins", type=int, default=8, help="Number of angle bins for initial velocity.")
+    p.add_argument(
+        "--episodes-per-bucket",
+        type=int,
+        default=None,
+        help="If set with --stratified-init, draw exactly this many episodes per (cell,angle) bucket.",
+    )
     p.add_argument(
         "--wall-collision-mode",
         type=str,
@@ -371,6 +391,15 @@ def main():
     args = parse_args()
     if args.divergence_threshold < 0.0:
         raise ValueError("--divergence-threshold must be >= 0")
+    if args.fixed_speed is not None and args.fixed_speed <= 0.0:
+        raise ValueError("--fixed-speed must be > 0 when provided.")
+    if args.pos_grid_n <= 0:
+        raise ValueError("--pos-grid-n must be >= 1.")
+    if args.angle_bins <= 0:
+        raise ValueError("--angle-bins must be >= 1.")
+    if args.episodes_per_bucket is not None and args.episodes_per_bucket <= 0:
+        raise ValueError("--episodes-per-bucket must be >= 1 when provided.")
+
     set_seed(args.seed)
     device = resolve_device(args.device)
     if device == "cuda":
@@ -386,8 +415,14 @@ def main():
             "steps": args.steps,
             "dt": args.dt,
             "wall_collision_mode": args.wall_collision_mode,
+            "stratified_init": args.stratified_init,
+            "pos_grid_n": args.pos_grid_n,
+            "angle_bins": args.angle_bins,
+            "episodes_per_bucket": args.episodes_per_bucket,
             "epochs": args.epochs,
             "batch_size": args.batch_size,
+            "speed_max": args.speed_max,
+            "fixed_speed": args.fixed_speed,
             "multistep_horizon": args.multistep_horizon,
             "collision_weight": args.collision_weight,
             "rebalance_sampling": args.rebalance_sampling,
@@ -420,6 +455,11 @@ def main():
         dt=args.dt,
         speed_max=args.speed_max,
         seed=args.seed,
+        stratified_init=args.stratified_init,
+        pos_grid_n=args.pos_grid_n,
+        angle_bins=args.angle_bins,
+        episodes_per_bucket=args.episodes_per_bucket,
+        fixed_speed=args.fixed_speed,
     )
     print(
         f"Generated episodes: pos_all={pos_all.shape}, vel_all={vel_all.shape}, "

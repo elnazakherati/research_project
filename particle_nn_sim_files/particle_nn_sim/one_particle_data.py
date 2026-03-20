@@ -13,7 +13,67 @@ def sample_init_1p(W, H, radius, speed_max=0.7, seed=None):
     return pos[None, :], vel[None, :]
 
 
-def collect_episodes_1p(sim, E=300, steps=1000, dt=0.01, speed_max=0.7, seed=0):
+def sample_init_1p_stratified(
+    W,
+    H,
+    radius,
+    pos_grid_n,
+    angle_bins,
+    cell_idx,
+    angle_idx,
+    speed_max=0.7,
+    fixed_speed=None,
+    rng=None,
+):
+    """Sample one initial condition from a chosen (cell, angle-bin)."""
+    if rng is None:
+        rng = np.random.default_rng(0)
+    g = int(pos_grid_n)
+    a = int(angle_bins)
+    if g < 1 or a < 1:
+        raise ValueError("pos_grid_n and angle_bins must be >= 1")
+
+    # Position cell
+    ix, iy = int(cell_idx)
+    if ix < 0 or ix >= g or iy < 0 or iy >= g:
+        raise ValueError(f"cell_idx {(ix, iy)} out of range for grid {g}x{g}")
+    x0 = radius + (W - 2.0 * radius) * (ix / g)
+    x1 = radius + (W - 2.0 * radius) * ((ix + 1) / g)
+    y0 = radius + (H - 2.0 * radius) * (iy / g)
+    y1 = radius + (H - 2.0 * radius) * ((iy + 1) / g)
+    x = rng.uniform(x0, x1)
+    y = rng.uniform(y0, y1)
+
+    # Angle bin
+    ia = int(angle_idx)
+    if ia < 0 or ia >= a:
+        raise ValueError(f"angle_idx {ia} out of range for {a} bins")
+    th0 = (2.0 * np.pi) * (ia / a)
+    th1 = (2.0 * np.pi) * ((ia + 1) / a)
+    theta = rng.uniform(th0, th1)
+
+    if fixed_speed is None:
+        mag = rng.uniform(0.0, float(speed_max))
+    else:
+        mag = float(fixed_speed)
+    vel = np.array([mag * np.cos(theta), mag * np.sin(theta)], dtype=np.float32)
+    pos = np.array([x, y], dtype=np.float32)
+    return pos[None, :], vel[None, :]
+
+
+def collect_episodes_1p(
+    sim,
+    E=300,
+    steps=1000,
+    dt=0.01,
+    speed_max=0.7,
+    seed=0,
+    stratified_init=False,
+    pos_grid_n=4,
+    angle_bins=8,
+    episodes_per_bucket=None,
+    fixed_speed=None,
+):
     rng = np.random.default_rng(seed)
     T = int(steps) + 1
 
@@ -25,14 +85,77 @@ def collect_episodes_1p(sim, E=300, steps=1000, dt=0.01, speed_max=0.7, seed=0):
     W = float(sim.W)
     H = float(sim.H)
 
+    if fixed_speed is not None and float(fixed_speed) < 0.0:
+        raise ValueError("fixed_speed must be >= 0 when provided")
+
+    # Optional stratified schedule over (position-cell, angle-bin) buckets.
+    bucket_schedule = None
+    if bool(stratified_init):
+        g = int(pos_grid_n)
+        a = int(angle_bins)
+        if g < 1 or a < 1:
+            raise ValueError("pos_grid_n and angle_bins must be >= 1 for stratified_init")
+        n_buckets = g * g * a
+        if episodes_per_bucket is not None:
+            epb = int(episodes_per_bucket)
+            if epb < 1:
+                raise ValueError("episodes_per_bucket must be >= 1")
+            expected = epb * n_buckets
+            if int(E) != expected:
+                raise ValueError(
+                    f"With episodes_per_bucket={epb}, expected E={expected} for "
+                    f"{g}x{g} position grid and {a} angle bins, got E={E}"
+                )
+            counts = np.full(n_buckets, epb, dtype=np.int64)
+        else:
+            # Balanced split with at most 1 difference between buckets.
+            q = int(E) // n_buckets
+            r = int(E) % n_buckets
+            counts = np.full(n_buckets, q, dtype=np.int64)
+            if r > 0:
+                counts[:r] += 1
+
+        bucket_schedule = []
+        for bid in range(n_buckets):
+            c = int(counts[bid])
+            if c <= 0:
+                continue
+            ix = bid // (g * a)
+            rem = bid % (g * a)
+            iy = rem // a
+            ia = rem % a
+            for _ in range(c):
+                bucket_schedule.append((ix, iy, ia))
+        # Shuffle schedule to avoid deterministic ordering artifacts.
+        rng.shuffle(bucket_schedule)
+
     for e in range(E):
-        pos0, vel0 = sample_init_1p(
-            W,
-            H,
-            radius,
-            speed_max=speed_max,
-            seed=rng.integers(1_000_000_000),
-        )
+        if bucket_schedule is None:
+            pos0, vel0 = sample_init_1p(
+                W,
+                H,
+                radius,
+                speed_max=speed_max,
+                seed=rng.integers(1_000_000_000),
+            )
+            if fixed_speed is not None:
+                theta = np.arctan2(float(vel0[0, 1]), float(vel0[0, 0]))
+                s = float(fixed_speed)
+                vel0 = np.array([[s * np.cos(theta), s * np.sin(theta)]], dtype=np.float32)
+        else:
+            ix, iy, ia = bucket_schedule[e]
+            pos0, vel0 = sample_init_1p_stratified(
+                W=W,
+                H=H,
+                radius=radius,
+                pos_grid_n=int(pos_grid_n),
+                angle_bins=int(angle_bins),
+                cell_idx=(int(ix), int(iy)),
+                angle_idx=int(ia),
+                speed_max=speed_max,
+                fixed_speed=fixed_speed,
+                rng=rng,
+            )
         sim.reset(pos0, vel0)
 
         pos_traj, vel_traj = sim.rollout(dt=dt, steps=steps)
@@ -58,6 +181,11 @@ def collect_episodes_1p(sim, E=300, steps=1000, dt=0.01, speed_max=0.7, seed=0):
         "masses": sim.masses.astype(np.float32),
         "restitution": np.float32(sim.restitution),
         "wall_mode": str(getattr(sim, "wall_mode", "clamp")),
+        "stratified_init": bool(stratified_init),
+        "pos_grid_n": int(pos_grid_n),
+        "angle_bins": int(angle_bins),
+        "episodes_per_bucket": None if episodes_per_bucket is None else int(episodes_per_bucket),
+        "fixed_speed": None if fixed_speed is None else float(fixed_speed),
     }
     return pos_all, vel_all, coll_all, meta
 
