@@ -37,6 +37,12 @@ def parse_args():
     p.add_argument("--num-rollouts", type=int, default=5, help="Number of new random rollouts")
     p.add_argument("--rollout-steps", type=int, default=1000)
     p.add_argument("--speed-max", type=float, default=0.7)
+    p.add_argument(
+        "--fixed-speed",
+        type=float,
+        default=None,
+        help="If set, sample all eval initial velocities with this fixed speed magnitude.",
+    )
     p.add_argument("--fps", type=int, default=50)
     p.add_argument("--frame-stride", type=int, default=1, help="Use every k-th frame when rendering videos.")
     p.add_argument("--save-overlay", type=str2bool, default=True, help="Also save single-axis GT/NN overlay video.")
@@ -74,6 +80,8 @@ def main():
         raise ValueError("--frame-stride must be >= 1")
     if args.divergence_threshold < 0.0:
         raise ValueError("--divergence-threshold must be >= 0")
+    if args.fixed_speed is not None and args.fixed_speed < 0.0:
+        raise ValueError("--fixed-speed must be >= 0 when provided.")
     rng = np.random.default_rng(args.seed)
 
     ckpt_path = Path(args.ckpt)
@@ -111,7 +119,16 @@ def main():
 
     for i in range(int(args.num_rollouts)):
         seed_i = int(rng.integers(1_000_000_000))
-        pos0, vel0 = sample_init_1p(W, H, radius, speed_max=args.speed_max, seed=seed_i)
+        if args.fixed_speed is None:
+            pos0, vel0 = sample_init_1p(W, H, radius, speed_max=args.speed_max, seed=seed_i)
+        else:
+            rng_i = np.random.default_rng(seed_i)
+            x = rng_i.uniform(radius, W - radius)
+            y = rng_i.uniform(radius, H - radius)
+            theta = rng_i.uniform(0.0, 2.0 * np.pi)
+            s = float(args.fixed_speed)
+            pos0 = np.array([[x, y]], dtype=np.float32)
+            vel0 = np.array([[s * np.cos(theta), s * np.sin(theta)]], dtype=np.float32)
 
         sim_true = ParticleSim2D(
             W=W,
@@ -231,6 +248,7 @@ def main():
         "num_rollouts": int(args.num_rollouts),
         "rollout_steps": int(args.rollout_steps),
         "speed_max": float(args.speed_max),
+        "fixed_speed": None if args.fixed_speed is None else float(args.fixed_speed),
         "divergence_threshold": float(args.divergence_threshold),
         "divergence_rate": float(np.mean(diverged)),
         "ttf_mean": float(np.mean(ttf)),
