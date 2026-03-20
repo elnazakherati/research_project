@@ -34,7 +34,12 @@ def sample_init_1p_stratified(
         raise ValueError("pos_grid_n and angle_bins must be >= 1")
 
     # Position cell
-    ix, iy = int(cell_idx)
+    try:
+        ix, iy = cell_idx
+    except Exception as e:
+        raise ValueError(f"cell_idx must be a 2-tuple/list, got {cell_idx!r}") from e
+    ix = int(ix)
+    iy = int(iy)
     if ix < 0 or ix >= g or iy < 0 or iy >= g:
         raise ValueError(f"cell_idx {(ix, iy)} out of range for grid {g}x{g}")
     x0 = radius + (W - 2.0 * radius) * (ix / g)
