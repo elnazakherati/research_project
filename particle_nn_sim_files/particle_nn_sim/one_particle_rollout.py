@@ -176,6 +176,8 @@ def animate_overlay_gt_perturbed_1p(
     dt,
     interval=20,
     title="Ground Truth vs Perturbed Ground Truth",
+    label_ref="GT",
+    label_pert="GT (perturbed)",
 ):
     pos_ref = np.asarray(pos_ref, dtype=np.float32)
     pos_pert = np.asarray(pos_pert, dtype=np.float32)
@@ -192,8 +194,8 @@ def animate_overlay_gt_perturbed_1p(
     ax.set_title(title)
     ax.plot([0, W, W, 0, 0], [0, 0, H, H, 0], lw=2)
 
-    (trace_ref,) = ax.plot([], [], color="tab:green", lw=2.0, alpha=0.9, label="GT")
-    (trace_pert,) = ax.plot([], [], color="tab:orange", lw=2.0, alpha=0.35, label="GT (perturbed)")
+    (trace_ref,) = ax.plot([], [], color="tab:green", lw=2.0, alpha=0.9, label=str(label_ref))
+    (trace_pert,) = ax.plot([], [], color="tab:orange", lw=2.0, alpha=0.35, label=str(label_pert))
     c_ref = plt.Circle(pos_ref[0, 0], display_radius, color="tab:green", fill=True, alpha=0.9)
     c_pert = plt.Circle(pos_pert[0, 0], display_radius, color="tab:orange", fill=True, alpha=0.35)
     ax.add_patch(c_ref)

@@ -57,6 +57,7 @@ def parse_args():
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--no-render", type=str2bool, default=False)
     p.add_argument("--save-overlay", type=str2bool, default=True)
+    p.add_argument("--save-side-by-side", type=str2bool, default=False)
     p.add_argument("--fps", type=int, default=50)
     p.add_argument("--frame-stride", type=int, default=1)
     p.add_argument("--out-dir", type=str, default="checkpoints/eval_trainset_1p")
@@ -105,34 +106,45 @@ def main():
     restitution = float(meta["restitution"])
     wall_mode = get_wall_mode(cfg, meta)
 
-    # Recreate the same generated dataset used by training.
-    sim_gen = ParticleSim2D(
-        W=W,
-        H=H,
-        radii=np.asarray(meta["radii"], dtype=float),
-        masses=np.asarray(meta["masses"], dtype=float),
-        restitution=restitution,
-        seed=int(cfg["seed"]),
-        wall_mode=wall_mode,
-    )
-    pos_all, vel_all, coll_all, _ = collect_episodes_1p(
-        sim_gen,
-        E=int(cfg["episodes"]),
-        steps=int(cfg["steps"]),
-        dt=float(cfg["dt"]),
-        speed_max=float(cfg.get("speed_max", 0.7)),
-        seed=int(cfg["seed"]),
-        stratified_init=bool(cfg.get("stratified_init", False)),
-        pos_grid_n=int(cfg.get("pos_grid_n", 4)),
-        angle_bins=int(cfg.get("angle_bins", 8)),
-        episodes_per_bucket=cfg.get("episodes_per_bucket", None),
-        fixed_speed=cfg.get("fixed_speed", None),
-    )
+    split_indices = ckpt.get("split_indices", None)
+    episode_init = ckpt.get("episode_init", None)
 
-    E = pos_all.shape[0]
-    n_train = int(float(cfg.get("train_split", 0.8)) * E)
-    train_eps = np.arange(n_train)
-    test_eps = np.arange(n_train, E)
+    if split_indices is not None and episode_init is not None:
+        pos0_all = np.asarray(episode_init["pos0"], dtype=np.float32)  # (E,1,2)
+        vel0_all = np.asarray(episode_init["vel0"], dtype=np.float32)  # (E,1,2)
+        train_eps = np.asarray(split_indices["train_eps"], dtype=np.int64)
+        test_eps = np.asarray(split_indices["test_eps"], dtype=np.int64)
+    else:
+        # Fallback path for older checkpoints: regenerate dataset from config.
+        sim_gen = ParticleSim2D(
+            W=W,
+            H=H,
+            radii=np.asarray(meta["radii"], dtype=float),
+            masses=np.asarray(meta["masses"], dtype=float),
+            restitution=restitution,
+            seed=int(cfg["seed"]),
+            wall_mode=wall_mode,
+        )
+        pos_all, vel_all, coll_all, _ = collect_episodes_1p(
+            sim_gen,
+            E=int(cfg["episodes"]),
+            steps=int(cfg["steps"]),
+            dt=float(cfg["dt"]),
+            speed_max=float(cfg.get("speed_max", 0.7)),
+            seed=int(cfg["seed"]),
+            stratified_init=bool(cfg.get("stratified_init", False)),
+            pos_grid_n=int(cfg.get("pos_grid_n", 4)),
+            angle_bins=int(cfg.get("angle_bins", 8)),
+            episodes_per_bucket=cfg.get("episodes_per_bucket", None),
+            fixed_speed=cfg.get("fixed_speed", None),
+        )
+        pos0_all = pos_all[:, 0].astype(np.float32)
+        vel0_all = vel_all[:, 0].astype(np.float32)
+        E = pos_all.shape[0]
+        n_train = int(float(cfg.get("train_split", 0.8)) * E)
+        train_eps = np.arange(n_train)
+        test_eps = np.arange(n_train, E)
+
     split_eps = train_eps if args.split == "train" else test_eps
     if len(split_eps) == 0:
         raise RuntimeError(f"No episodes available in split '{args.split}'.")
@@ -151,8 +163,8 @@ def main():
 
     rows = []
     for j, e in enumerate(eval_eps):
-        pos0 = pos_all[e, 0].astype(np.float32)
-        vel0 = vel_all[e, 0].astype(np.float32)
+        pos0 = pos0_all[e].astype(np.float32)
+        vel0 = vel0_all[e].astype(np.float32)
 
         sim_true = ParticleSim2D(
             W=W,
@@ -201,19 +213,20 @@ def main():
             pos_pred_v = pos_pred[:: args.frame_stride]
             dt_v = dt * float(args.frame_stride)
 
-            side = animate_side_by_side_1p(
-                pos_true=pos_true_v,
-                pos_pred=pos_pred_v,
-                radius=radius,
-                W=W,
-                H=H,
-                dt=dt_v,
-                title_left=f"GT ({args.split}) ep={int(e)}",
-                title_right=f"NN ({args.split}) ep={int(e)}",
-            )
-            side_path = out_dir / f"{args.split}_ep_{int(e):05d}_gt_vs_pred_1p.mp4"
-            save_animation_mp4(side, str(side_path), fps=args.fps)
-            row["video"] = side_path.name
+            if args.save_side_by_side:
+                side = animate_side_by_side_1p(
+                    pos_true=pos_true_v,
+                    pos_pred=pos_pred_v,
+                    radius=radius,
+                    W=W,
+                    H=H,
+                    dt=dt_v,
+                    title_left=f"GT ({args.split}) ep={int(e)}",
+                    title_right=f"NN ({args.split}) ep={int(e)}",
+                )
+                side_path = out_dir / f"{args.split}_ep_{int(e):05d}_gt_vs_pred_1p.mp4"
+                save_animation_mp4(side, str(side_path), fps=args.fps)
+                row["video"] = side_path.name
 
             if args.save_overlay:
                 overlay = animate_overlay_gt_perturbed_1p(
@@ -224,6 +237,8 @@ def main():
                     H=H,
                     dt=dt_v,
                     title=f"GT vs NN ({args.split}) ep={int(e)}",
+                    label_ref="GT",
+                    label_pert="NN rollout",
                 )
                 overlay_path = out_dir / f"{args.split}_ep_{int(e):05d}_overlay_1p.mp4"
                 save_animation_mp4(overlay, str(overlay_path), fps=args.fps)
@@ -289,4 +304,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
