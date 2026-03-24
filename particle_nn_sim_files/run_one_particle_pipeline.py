@@ -17,6 +17,7 @@ from particle_nn_sim.models import ResMLP
 from particle_nn_sim.train import fit_standardizer, apply_standardizer, StepDataset
 from particle_nn_sim.one_particle_data import collect_episodes_1p, episodes_to_XY_residual_1p
 from particle_nn_sim.one_particle_rollout import (
+    animate_overlay_gt_perturbed_1p,
     animate_single_rollout_1p,
     animate_side_by_side_1p,
     nn_rollout_residual_1p,
@@ -83,6 +84,12 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--collision-weight", type=float, default=10.0)
     p.add_argument("--multistep-horizon", type=int, default=10)
+    p.add_argument(
+        "--unfold-loss-weight",
+        type=float,
+        default=0.0,
+        help="Auxiliary weight for unfolded-trajectory position MSE over the rollout horizon.",
+    )
     p.add_argument("--rebalance-sampling", type=str2bool, default=True)
     p.add_argument("--target-collision-frac", type=float, default=0.3)
 
@@ -95,6 +102,18 @@ def parse_args():
         help="First step where rollout position error exceeds this value is divergence step (TTF).",
     )
     p.add_argument("--fps", type=int, default=50)
+    p.add_argument(
+        "--save-overlay-rollout",
+        type=str2bool,
+        default=True,
+        help="Save GT vs NN overlay rollout video on one axis.",
+    )
+    p.add_argument(
+        "--save-side-by-side-rollout",
+        type=str2bool,
+        default=True,
+        help="Save side-by-side GT vs NN rollout video.",
+    )
     p.add_argument("--out-dir", type=str, default="checkpoints/one_particle_run")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--seed", type=int, default=0)
@@ -200,6 +219,50 @@ def make_weighted_sampler(binary_labels, target_collision_frac):
     )
 
 
+def _unwrap_axis_nearest(folded_axis, L):
+    """
+    Unwrap folded 1D coordinate trajectory into mirrored-tile coordinates.
+
+    folded_axis: (B, H) in [0, L]
+    returns: (B, H) continuous unfolded coordinate per batch row
+    """
+    if folded_axis.ndim != 2:
+        raise ValueError(f"folded_axis must be 2D (B,H), got {tuple(folded_axis.shape)}")
+    B, H = folded_axis.shape
+    if H == 0:
+        return folded_axis
+    twoL = float(2.0 * L)
+    out = torch.zeros_like(folded_axis)
+    out[:, 0] = folded_axis[:, 0]
+    for t in range(1, H):
+        x = folded_axis[:, t]  # (B,)
+        prev = out[:, t - 1]  # (B,)
+        # Estimate nearest translation index in mirrored tiling.
+        base = torch.round((prev - x) / twoL)
+        candidates = []
+        for off in (-1.0, 0.0, 1.0):
+            k = base + off
+            candidates.append(x + twoL * k)   # non-mirrored tile copy
+            candidates.append(-x + twoL * k)  # mirrored tile copy
+        cands = torch.stack(candidates, dim=1)  # (B,6)
+        idx = torch.argmin(torch.abs(cands - prev[:, None]), dim=1)  # (B,)
+        out[:, t] = cands[torch.arange(B, device=folded_axis.device), idx]
+    return out
+
+
+def unfold_positions_nearest(pos_seq, W, H):
+    """
+    Convert folded (x,y) sequence to unfolded mirrored-tile coordinates.
+
+    pos_seq: (B, T, 2) with folded coordinates in [0,W]x[0,H]
+    """
+    if pos_seq.ndim != 3 or pos_seq.shape[-1] != 2:
+        raise ValueError(f"pos_seq must have shape (B,T,2), got {tuple(pos_seq.shape)}")
+    ux = _unwrap_axis_nearest(pos_seq[:, :, 0], float(W))
+    uy = _unwrap_axis_nearest(pos_seq[:, :, 1], float(H))
+    return torch.stack([ux, uy], dim=2)
+
+
 def train_multistep_1p(
     model,
     train_loader,
@@ -215,6 +278,9 @@ def train_multistep_1p(
     dt,
     radius,
     mass,
+    box_W,
+    box_H,
+    unfold_loss_weight=0.0,
     wandb_run=None,
 ):
     model.to(device)
@@ -227,9 +293,18 @@ def train_multistep_1p(
     dt_t = float(dt)
     r_t = float(radius)
     m_t = float(mass)
+    W_t = float(box_W)
+    H_t = float(box_H)
     cw = float(collision_weight)
+    ulw = float(unfold_loss_weight)
 
-    history = {"train_loss": [], "test_mse_all": [], "test_mse_collision": [], "test_mse_noncollision": []}
+    history = {
+        "train_loss": [],
+        "train_unfold_loss": [],
+        "test_mse_all": [],
+        "test_mse_collision": [],
+        "test_mse_noncollision": [],
+    }
     best = {"epoch": -1, "mse_all": float("inf"), "state_dict": None, "stats": None}
 
     def eval_loader(loader):
@@ -299,6 +374,7 @@ def train_multistep_1p(
         t0 = time.time()
         model.train()
         running = 0.0
+        running_unfold = 0.0
         n_samples = 0
 
         for state0, future_gt, coll_future in train_loader:
@@ -309,6 +385,8 @@ def train_multistep_1p(
 
             state = state0
             step_losses = []
+            pred_pos_seq = []
+            gt_pos_seq = []
             for k in range(H):
                 x_raw = torch.cat(
                     [
@@ -334,19 +412,35 @@ def train_multistep_1p(
                     w = torch.where(coll_future[:, k] > 0, torch.full_like(mse_k, cw), torch.ones_like(mse_k))
                     mse_k = w * mse_k
                 step_losses.append(mse_k.mean())
+                pred_pos_seq.append(state[:, 0:2])
+                gt_pos_seq.append(gt_k[:, 0:2])
 
-            loss = torch.stack(step_losses).mean()
+            base_loss = torch.stack(step_losses).mean()
+            if ulw > 0.0:
+                pred_pos = torch.stack(pred_pos_seq, dim=1)  # (B,H,2)
+                gt_pos = torch.stack(gt_pos_seq, dim=1)  # (B,H,2)
+                pred_unf = unfold_positions_nearest(pred_pos, W=W_t, H=H_t)
+                gt_unf = unfold_positions_nearest(gt_pos, W=W_t, H=H_t)
+                unfold_loss = ((pred_unf - gt_unf) ** 2).mean()
+                loss = base_loss + ulw * unfold_loss
+                unfold_loss_val = float(unfold_loss.item())
+            else:
+                loss = base_loss
+                unfold_loss_val = 0.0
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
 
             running += loss.item() * B
+            running_unfold += unfold_loss_val * B
             n_samples += B
 
         train_loss = running / max(n_samples, 1)
+        train_unfold_loss = running_unfold / max(n_samples, 1)
         stats = eval_loader(test_loader)
         history["train_loss"].append(train_loss)
+        history["train_unfold_loss"].append(train_unfold_loss)
         history["test_mse_all"].append(stats["mse_all"])
         history["test_mse_collision"].append(stats["mse_collision"])
         history["test_mse_noncollision"].append(stats["mse_noncollision"])
@@ -360,6 +454,7 @@ def train_multistep_1p(
 
         print(
             f"Epoch {ep:03d} | train_loss={train_loss:.6f} "
+            f"| train_unfold={train_unfold_loss:.6f} "
             f"| test_mse={stats['mse_all']:.6f} "
             f"| test_collision={stats['mse_collision']:.6f} "
             f"| test_noncollision={stats['mse_noncollision']:.6f} "
@@ -371,6 +466,7 @@ def train_multistep_1p(
                 {
                     "epoch": ep,
                     "train_loss": train_loss,
+                    "train_unfold_loss": train_unfold_loss,
                     "test_mse_all": stats["mse_all"],
                     "test_mse_collision": stats["mse_collision"],
                     "test_mse_noncollision": stats["mse_noncollision"],
@@ -399,6 +495,8 @@ def main():
         raise ValueError("--angle-bins must be >= 1.")
     if args.episodes_per_bucket is not None and args.episodes_per_bucket <= 0:
         raise ValueError("--episodes-per-bucket must be >= 1 when provided.")
+    if args.unfold_loss_weight < 0.0:
+        raise ValueError("--unfold-loss-weight must be >= 0")
 
     set_seed(args.seed)
     device = resolve_device(args.device)
@@ -424,10 +522,13 @@ def main():
             "speed_max": args.speed_max,
             "fixed_speed": args.fixed_speed,
             "multistep_horizon": args.multistep_horizon,
+            "unfold_loss_weight": args.unfold_loss_weight,
             "collision_weight": args.collision_weight,
             "rebalance_sampling": args.rebalance_sampling,
             "target_collision_frac": args.target_collision_frac,
             "divergence_threshold": args.divergence_threshold,
+            "save_overlay_rollout": args.save_overlay_rollout,
+            "save_side_by_side_rollout": args.save_side_by_side_rollout,
             "seed": args.seed,
         },
     )
@@ -585,6 +686,9 @@ def main():
         dt=float(meta["dt"]),
         radius=float(meta["radii"][0]),
         mass=float(meta["masses"][0]),
+        box_W=float(meta["W"]),
+        box_H=float(meta["H"]),
+        unfold_loss_weight=float(args.unfold_loss_weight),
         wandb_run=wandb_run,
     )
 
@@ -622,16 +726,33 @@ def main():
         dt=float(meta["dt"]),
     )
 
-    # Save GT-vs-pred animation.
-    anim = animate_side_by_side_1p(
-        pos_true=pos_true,
-        pos_pred=pos_pred,
-        radius=float(meta["radii"][0]),
-        W=float(meta["W"]),
-        H=float(meta["H"]),
-        dt=float(meta["dt"]),
-    )
-    save_animation_mp4(anim, str(out_dir / "rollout_gt_vs_pred_1p.mp4"), fps=args.fps)
+    # Save GT-vs-pred animations.
+    if args.save_side_by_side_rollout:
+        anim = animate_side_by_side_1p(
+            pos_true=pos_true,
+            pos_pred=pos_pred,
+            radius=float(meta["radii"][0]),
+            W=float(meta["W"]),
+            H=float(meta["H"]),
+            dt=float(meta["dt"]),
+        )
+        save_animation_mp4(anim, str(out_dir / "rollout_gt_vs_pred_1p.mp4"), fps=args.fps)
+
+    if args.save_overlay_rollout:
+        overlay = animate_overlay_gt_perturbed_1p(
+            pos_ref=pos_true,
+            pos_pert=pos_pred,
+            radius=float(meta["radii"][0]),
+            W=float(meta["W"]),
+            H=float(meta["H"]),
+            dt=float(meta["dt"]),
+            title="GT vs NN rollout (same init)",
+        )
+        save_animation_mp4(
+            overlay,
+            str(out_dir / "rollout_gt_vs_pred_overlay_1p.mp4"),
+            fps=args.fps,
+        )
 
     # Analysis metrics.
     pos_err = np.linalg.norm(pos_true[:, 0, :] - pos_pred[:, 0, :], axis=1)
@@ -710,7 +831,10 @@ def main():
     print(" -", out_dir / "model_1p_resmlp.pt")
     print(" -", out_dir / "analysis_1p.json")
     print(" -", out_dir / "error_vs_timestep_1p.png")
-    print(" -", out_dir / "rollout_gt_vs_pred_1p.mp4")
+    if args.save_side_by_side_rollout:
+        print(" -", out_dir / "rollout_gt_vs_pred_1p.mp4")
+    if args.save_overlay_rollout:
+        print(" -", out_dir / "rollout_gt_vs_pred_overlay_1p.mp4")
     if args.save_train_episode_preview:
         print(" -", out_dir / "training_episode_example_1p.mp4")
 
