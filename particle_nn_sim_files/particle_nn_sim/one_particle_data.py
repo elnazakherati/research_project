@@ -82,6 +82,10 @@ def collect_episodes_1p(
     fixed_y=None,
     fixed_vx=None,
     fixed_vy=None,
+    fixed2_x=None,
+    fixed2_y=None,
+    fixed2_vx=None,
+    fixed2_vy=None,
 ):
     rng = np.random.default_rng(seed)
     T = int(steps) + 1
@@ -102,6 +106,15 @@ def collect_episodes_1p(
         raise ValueError(
             "If any of fixed_x/fixed_y/fixed_vx/fixed_vy is provided, all four must be provided."
         )
+    fixed2_ic_vals = (fixed2_x, fixed2_y, fixed2_vx, fixed2_vy)
+    use_fixed_ic2 = any(v is not None for v in fixed2_ic_vals)
+    if use_fixed_ic2 and not all(v is not None for v in fixed2_ic_vals):
+        raise ValueError(
+            "If any of fixed2_x/fixed2_y/fixed2_vx/fixed2_vy is provided, all four must be provided."
+        )
+    if use_fixed_ic2 and not use_fixed_ic:
+        raise ValueError("fixed2_* requires fixed_* (IC1) to also be provided.")
+
     if use_fixed_ic:
         fx = float(fixed_x)
         fy = float(fixed_y)
@@ -111,6 +124,15 @@ def collect_episodes_1p(
             raise ValueError(f"fixed_x={fx} outside valid range [{radius}, {W-radius}]")
         if not (radius <= fy <= H - radius):
             raise ValueError(f"fixed_y={fy} outside valid range [{radius}, {H-radius}]")
+    if use_fixed_ic2:
+        fx2 = float(fixed2_x)
+        fy2 = float(fixed2_y)
+        fvx2 = float(fixed2_vx)
+        fvy2 = float(fixed2_vy)
+        if not (radius <= fx2 <= W - radius):
+            raise ValueError(f"fixed2_x={fx2} outside valid range [{radius}, {W-radius}]")
+        if not (radius <= fy2 <= H - radius):
+            raise ValueError(f"fixed2_y={fy2} outside valid range [{radius}, {H-radius}]")
 
     # Optional stratified schedule over (position-cell, angle-bin) buckets.
     bucket_schedule = None
@@ -155,8 +177,12 @@ def collect_episodes_1p(
 
     for e in range(E):
         if use_fixed_ic:
-            pos0 = np.array([[fx, fy]], dtype=np.float32)
-            vel0 = np.array([[fvx, fvy]], dtype=np.float32)
+            if use_fixed_ic2 and (e % 2 == 1):
+                pos0 = np.array([[fx2, fy2]], dtype=np.float32)
+                vel0 = np.array([[fvx2, fvy2]], dtype=np.float32)
+            else:
+                pos0 = np.array([[fx, fy]], dtype=np.float32)
+                vel0 = np.array([[fvx, fvy]], dtype=np.float32)
         elif bucket_schedule is None:
             pos0, vel0 = sample_init_1p(
                 W,
@@ -217,6 +243,10 @@ def collect_episodes_1p(
         "fixed_y": None if fixed_y is None else float(fixed_y),
         "fixed_vx": None if fixed_vx is None else float(fixed_vx),
         "fixed_vy": None if fixed_vy is None else float(fixed_vy),
+        "fixed2_x": None if fixed2_x is None else float(fixed2_x),
+        "fixed2_y": None if fixed2_y is None else float(fixed2_y),
+        "fixed2_vx": None if fixed2_vx is None else float(fixed2_vx),
+        "fixed2_vy": None if fixed2_vy is None else float(fixed2_vy),
     }
     return pos_all, vel_all, coll_all, meta
 
