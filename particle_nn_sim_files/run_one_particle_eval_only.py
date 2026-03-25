@@ -44,6 +44,10 @@ def parse_args():
         help="If set, sample all eval initial velocities with this fixed speed magnitude.",
     )
     p.add_argument("--fps", type=int, default=50)
+    p.add_argument("--fixed-x", type=float, default=None, help="Fixed initial x position for all eval rollouts.")
+    p.add_argument("--fixed-y", type=float, default=None, help="Fixed initial y position for all eval rollouts.")
+    p.add_argument("--fixed-vx", type=float, default=None, help="Fixed initial vx for all eval rollouts.")
+    p.add_argument("--fixed-vy", type=float, default=None, help="Fixed initial vy for all eval rollouts.")
     p.add_argument("--frame-stride", type=int, default=1, help="Use every k-th frame when rendering videos.")
     p.add_argument("--save-overlay", type=str2bool, default=True, help="Also save single-axis GT/NN overlay video.")
     p.add_argument("--no-render", type=str2bool, default=False, help="Skip MP4/PNG rendering and compute metrics only.")
@@ -82,6 +86,10 @@ def main():
         raise ValueError("--divergence-threshold must be >= 0")
     if args.fixed_speed is not None and args.fixed_speed < 0.0:
         raise ValueError("--fixed-speed must be >= 0 when provided.")
+    fixed_ic_vals = (args.fixed_x, args.fixed_y, args.fixed_vx, args.fixed_vy)
+    use_fixed_ic = any(v is not None for v in fixed_ic_vals)
+    if use_fixed_ic and not all(v is not None for v in fixed_ic_vals):
+        raise ValueError("If any of --fixed-x/--fixed-y/--fixed-vx/--fixed-vy is set, all four must be set.")
     rng = np.random.default_rng(args.seed)
 
     ckpt_path = Path(args.ckpt)
@@ -110,6 +118,13 @@ def main():
     radius = float(np.asarray(meta["radii"], dtype=np.float32)[0])
     mass = float(np.asarray(meta["masses"], dtype=np.float32)[0])
     restitution = float(meta["restitution"])
+    if use_fixed_ic:
+        fx = float(args.fixed_x)
+        fy = float(args.fixed_y)
+        if not (radius <= fx <= W - radius):
+            raise ValueError(f"--fixed-x={fx} outside valid range [{radius}, {W-radius}]")
+        if not (radius <= fy <= H - radius):
+            raise ValueError(f"--fixed-y={fy} outside valid range [{radius}, {H-radius}]")
     if args.wall_collision_mode == "auto":
         wall_mode = str(meta.get("wall_mode", "clamp"))
     else:
@@ -118,17 +133,22 @@ def main():
     rollout_rows = []
 
     for i in range(int(args.num_rollouts)):
-        seed_i = int(rng.integers(1_000_000_000))
-        if args.fixed_speed is None:
-            pos0, vel0 = sample_init_1p(W, H, radius, speed_max=args.speed_max, seed=seed_i)
+        if use_fixed_ic:
+            seed_i = int(args.seed)
+            pos0 = np.array([[float(args.fixed_x), float(args.fixed_y)]], dtype=np.float32)
+            vel0 = np.array([[float(args.fixed_vx), float(args.fixed_vy)]], dtype=np.float32)
         else:
-            rng_i = np.random.default_rng(seed_i)
-            x = rng_i.uniform(radius, W - radius)
-            y = rng_i.uniform(radius, H - radius)
-            theta = rng_i.uniform(0.0, 2.0 * np.pi)
-            s = float(args.fixed_speed)
-            pos0 = np.array([[x, y]], dtype=np.float32)
-            vel0 = np.array([[s * np.cos(theta), s * np.sin(theta)]], dtype=np.float32)
+            seed_i = int(rng.integers(1_000_000_000))
+            if args.fixed_speed is None:
+                pos0, vel0 = sample_init_1p(W, H, radius, speed_max=args.speed_max, seed=seed_i)
+            else:
+                rng_i = np.random.default_rng(seed_i)
+                x = rng_i.uniform(radius, W - radius)
+                y = rng_i.uniform(radius, H - radius)
+                theta = rng_i.uniform(0.0, 2.0 * np.pi)
+                s = float(args.fixed_speed)
+                pos0 = np.array([[x, y]], dtype=np.float32)
+                vel0 = np.array([[s * np.cos(theta), s * np.sin(theta)]], dtype=np.float32)
 
         sim_true = ParticleSim2D(
             W=W,
@@ -201,6 +221,8 @@ def main():
                     H=H,
                     dt=dt_v,
                     title="GT vs NN rollout (same init)",
+                    label_ref="GT",
+                    label_pert="NN rollout",
                 )
                 overlay_mp4 = out_dir / f"rollout_{i:03d}_gt_vs_pred_overlay_1p.mp4"
                 save_animation_mp4(overlay_anim, str(overlay_mp4), fps=args.fps)
@@ -249,6 +271,10 @@ def main():
         "rollout_steps": int(args.rollout_steps),
         "speed_max": float(args.speed_max),
         "fixed_speed": None if args.fixed_speed is None else float(args.fixed_speed),
+        "fixed_x": None if args.fixed_x is None else float(args.fixed_x),
+        "fixed_y": None if args.fixed_y is None else float(args.fixed_y),
+        "fixed_vx": None if args.fixed_vx is None else float(args.fixed_vx),
+        "fixed_vy": None if args.fixed_vy is None else float(args.fixed_vy),
         "divergence_threshold": float(args.divergence_threshold),
         "divergence_rate": float(np.mean(diverged)),
         "ttf_mean": float(np.mean(ttf)),

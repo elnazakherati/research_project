@@ -53,6 +53,10 @@ def parse_args():
     p.add_argument("--train-split", type=float, default=0.8)
     p.add_argument("--radius", type=float, default=0.0)
     p.add_argument("--mass", type=float, default=1.0)
+    p.add_argument("--fixed-x", type=float, default=None, help="Fixed initial x position for all episodes.")
+    p.add_argument("--fixed-y", type=float, default=None, help="Fixed initial y position for all episodes.")
+    p.add_argument("--fixed-vx", type=float, default=None, help="Fixed initial vx for all episodes.")
+    p.add_argument("--fixed-vy", type=float, default=None, help="Fixed initial vy for all episodes.")
     p.add_argument(
         "--stratified-init",
         type=str2bool,
@@ -111,7 +115,7 @@ def parse_args():
     p.add_argument(
         "--save-side-by-side-rollout",
         type=str2bool,
-        default=True,
+        default=False,
         help="Save side-by-side GT vs NN rollout video.",
     )
     p.add_argument("--out-dir", type=str, default="checkpoints/one_particle_run")
@@ -489,6 +493,9 @@ def main():
         raise ValueError("--divergence-threshold must be >= 0")
     if args.fixed_speed is not None and args.fixed_speed <= 0.0:
         raise ValueError("--fixed-speed must be > 0 when provided.")
+    fixed_ic_vals = (args.fixed_x, args.fixed_y, args.fixed_vx, args.fixed_vy)
+    if any(v is not None for v in fixed_ic_vals) and not all(v is not None for v in fixed_ic_vals):
+        raise ValueError("If any of --fixed-x/--fixed-y/--fixed-vx/--fixed-vy is set, all four must be set.")
     if args.pos_grid_n <= 0:
         raise ValueError("--pos-grid-n must be >= 1.")
     if args.angle_bins <= 0:
@@ -523,6 +530,10 @@ def main():
             "fixed_speed": args.fixed_speed,
             "multistep_horizon": args.multistep_horizon,
             "unfold_loss_weight": args.unfold_loss_weight,
+            "fixed_x": args.fixed_x,
+            "fixed_y": args.fixed_y,
+            "fixed_vx": args.fixed_vx,
+            "fixed_vy": args.fixed_vy,
             "collision_weight": args.collision_weight,
             "rebalance_sampling": args.rebalance_sampling,
             "target_collision_frac": args.target_collision_frac,
@@ -561,6 +572,10 @@ def main():
         angle_bins=args.angle_bins,
         episodes_per_bucket=args.episodes_per_bucket,
         fixed_speed=args.fixed_speed,
+        fixed_x=args.fixed_x,
+        fixed_y=args.fixed_y,
+        fixed_vx=args.fixed_vx,
+        fixed_vy=args.fixed_vy,
     )
     print(
         f"Generated episodes: pos_all={pos_all.shape}, vel_all={vel_all.shape}, "
@@ -747,6 +762,8 @@ def main():
             H=float(meta["H"]),
             dt=float(meta["dt"]),
             title="GT vs NN rollout (same init)",
+            label_ref="GT",
+            label_pert="NN rollout",
         )
         save_animation_mp4(
             overlay,
@@ -809,6 +826,14 @@ def main():
         "y_mean": y_mean,
         "y_std": y_std,
         "meta": meta,
+        "split_indices": {
+            "train_eps": np.asarray(train_eps, dtype=np.int64),
+            "test_eps": np.asarray(test_eps, dtype=np.int64),
+        },
+        "episode_init": {
+            "pos0": pos_all[:, 0].astype(np.float32),  # (E,1,2)
+            "vel0": vel_all[:, 0].astype(np.float32),  # (E,1,2)
+        },
         "config": vars(args),
     }
     torch.save(ckpt, out_dir / "model_1p_resmlp.pt")
