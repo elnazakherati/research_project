@@ -78,6 +78,10 @@ def collect_episodes_1p(
     angle_bins=8,
     episodes_per_bucket=None,
     fixed_speed=None,
+    fixed_x=None,
+    fixed_y=None,
+    fixed_vx=None,
+    fixed_vy=None,
 ):
     rng = np.random.default_rng(seed)
     T = int(steps) + 1
@@ -92,10 +96,25 @@ def collect_episodes_1p(
 
     if fixed_speed is not None and float(fixed_speed) < 0.0:
         raise ValueError("fixed_speed must be >= 0 when provided")
+    fixed_ic_vals = (fixed_x, fixed_y, fixed_vx, fixed_vy)
+    use_fixed_ic = any(v is not None for v in fixed_ic_vals)
+    if use_fixed_ic and not all(v is not None for v in fixed_ic_vals):
+        raise ValueError(
+            "If any of fixed_x/fixed_y/fixed_vx/fixed_vy is provided, all four must be provided."
+        )
+    if use_fixed_ic:
+        fx = float(fixed_x)
+        fy = float(fixed_y)
+        fvx = float(fixed_vx)
+        fvy = float(fixed_vy)
+        if not (radius <= fx <= W - radius):
+            raise ValueError(f"fixed_x={fx} outside valid range [{radius}, {W-radius}]")
+        if not (radius <= fy <= H - radius):
+            raise ValueError(f"fixed_y={fy} outside valid range [{radius}, {H-radius}]")
 
     # Optional stratified schedule over (position-cell, angle-bin) buckets.
     bucket_schedule = None
-    if bool(stratified_init):
+    if bool(stratified_init) and not use_fixed_ic:
         g = int(pos_grid_n)
         a = int(angle_bins)
         if g < 1 or a < 1:
@@ -135,7 +154,10 @@ def collect_episodes_1p(
         rng.shuffle(bucket_schedule)
 
     for e in range(E):
-        if bucket_schedule is None:
+        if use_fixed_ic:
+            pos0 = np.array([[fx, fy]], dtype=np.float32)
+            vel0 = np.array([[fvx, fvy]], dtype=np.float32)
+        elif bucket_schedule is None:
             pos0, vel0 = sample_init_1p(
                 W,
                 H,
@@ -191,6 +213,10 @@ def collect_episodes_1p(
         "angle_bins": int(angle_bins),
         "episodes_per_bucket": None if episodes_per_bucket is None else int(episodes_per_bucket),
         "fixed_speed": None if fixed_speed is None else float(fixed_speed),
+        "fixed_x": None if fixed_x is None else float(fixed_x),
+        "fixed_y": None if fixed_y is None else float(fixed_y),
+        "fixed_vx": None if fixed_vx is None else float(fixed_vx),
+        "fixed_vy": None if fixed_vy is None else float(fixed_vy),
     }
     return pos_all, vel_all, coll_all, meta
 
