@@ -57,6 +57,10 @@ def parse_args():
     p.add_argument("--fixed-y", type=float, default=None, help="Fixed initial y position for all episodes.")
     p.add_argument("--fixed-vx", type=float, default=None, help="Fixed initial vx for all episodes.")
     p.add_argument("--fixed-vy", type=float, default=None, help="Fixed initial vy for all episodes.")
+    p.add_argument("--fixed2-x", type=float, default=None, help="Optional second fixed initial x (alternating episodes).")
+    p.add_argument("--fixed2-y", type=float, default=None, help="Optional second fixed initial y (alternating episodes).")
+    p.add_argument("--fixed2-vx", type=float, default=None, help="Optional second fixed initial vx (alternating episodes).")
+    p.add_argument("--fixed2-vy", type=float, default=None, help="Optional second fixed initial vy (alternating episodes).")
     p.add_argument(
         "--stratified-init",
         type=str2bool,
@@ -496,6 +500,11 @@ def main():
     fixed_ic_vals = (args.fixed_x, args.fixed_y, args.fixed_vx, args.fixed_vy)
     if any(v is not None for v in fixed_ic_vals) and not all(v is not None for v in fixed_ic_vals):
         raise ValueError("If any of --fixed-x/--fixed-y/--fixed-vx/--fixed-vy is set, all four must be set.")
+    fixed2_ic_vals = (args.fixed2_x, args.fixed2_y, args.fixed2_vx, args.fixed2_vy)
+    if any(v is not None for v in fixed2_ic_vals) and not all(v is not None for v in fixed2_ic_vals):
+        raise ValueError("If any of --fixed2-x/--fixed2-y/--fixed2-vx/--fixed2-vy is set, all four must be set.")
+    if any(v is not None for v in fixed2_ic_vals) and not all(v is not None for v in fixed_ic_vals):
+        raise ValueError("--fixed2-* requires --fixed-* (IC1) to be set.")
     if args.pos_grid_n <= 0:
         raise ValueError("--pos-grid-n must be >= 1.")
     if args.angle_bins <= 0:
@@ -534,6 +543,10 @@ def main():
             "fixed_y": args.fixed_y,
             "fixed_vx": args.fixed_vx,
             "fixed_vy": args.fixed_vy,
+            "fixed2_x": args.fixed2_x,
+            "fixed2_y": args.fixed2_y,
+            "fixed2_vx": args.fixed2_vx,
+            "fixed2_vy": args.fixed2_vy,
             "collision_weight": args.collision_weight,
             "rebalance_sampling": args.rebalance_sampling,
             "target_collision_frac": args.target_collision_frac,
@@ -576,6 +589,10 @@ def main():
         fixed_y=args.fixed_y,
         fixed_vx=args.fixed_vx,
         fixed_vy=args.fixed_vy,
+        fixed2_x=args.fixed2_x,
+        fixed2_y=args.fixed2_y,
+        fixed2_vx=args.fixed2_vx,
+        fixed2_vy=args.fixed2_vy,
     )
     print(
         f"Generated episodes: pos_all={pos_all.shape}, vel_all={vel_all.shape}, "
