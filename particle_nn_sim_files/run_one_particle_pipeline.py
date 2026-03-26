@@ -93,6 +93,18 @@ def parse_args():
     p.add_argument("--collision-weight", type=float, default=10.0)
     p.add_argument("--multistep-horizon", type=int, default=10)
     p.add_argument(
+        "--freeflight-loss-weight",
+        type=float,
+        default=0.0,
+        help="Auxiliary weight for non-collision free-flight consistency loss.",
+    )
+    p.add_argument(
+        "--speed-loss-weight",
+        type=float,
+        default=0.0,
+        help="Auxiliary weight for non-collision speed-magnitude consistency loss.",
+    )
+    p.add_argument(
         "--unfold-loss-weight",
         type=float,
         default=0.0,
@@ -288,6 +300,8 @@ def train_multistep_1p(
     mass,
     box_W,
     box_H,
+    freeflight_loss_weight=0.0,
+    speed_loss_weight=0.0,
     unfold_loss_weight=0.0,
     wandb_run=None,
 ):
@@ -304,11 +318,16 @@ def train_multistep_1p(
     W_t = float(box_W)
     H_t = float(box_H)
     cw = float(collision_weight)
+    ffw = float(freeflight_loss_weight)
+    svw = float(speed_loss_weight)
     ulw = float(unfold_loss_weight)
 
     history = {
         "train_loss": [],
         "train_unfold_loss": [],
+        "train_mse_all": [],
+        "train_mse_collision": [],
+        "train_mse_noncollision": [],
         "test_mse_all": [],
         "test_mse_collision": [],
         "test_mse_noncollision": [],
@@ -383,6 +402,12 @@ def train_multistep_1p(
         model.train()
         running = 0.0
         running_unfold = 0.0
+        train_mse_all_sum = 0.0
+        train_mse_col_sum = 0.0
+        train_mse_non_sum = 0.0
+        train_n_all = 0
+        train_n_col = 0
+        train_n_non = 0
         n_samples = 0
 
         for state0, future_gt, coll_future in train_loader:
@@ -410,18 +435,43 @@ def train_multistep_1p(
 
                 pos = state[:, 0:2]
                 vel = state[:, 2:4]
+                speed_prev = torch.linalg.norm(vel, dim=1)  # (B,)
                 pos_free = pos + vel * dt_t
                 state_free = torch.cat([pos_free, vel], dim=1)
                 state = state_free + resid
 
                 gt_k = future_gt[:, k, :]
-                mse_k = ((state - gt_k) ** 2).mean(dim=1)  # (B,)
+                mse_k_raw = ((state - gt_k) ** 2).mean(dim=1)  # (B,)
+                mse_k = mse_k_raw
+                non_mask = coll_future[:, k] <= 0.0  # (B,)
+                col_mask = ~non_mask
+
+                # --- auxiliary regularizers on non-collision steps ---
+                if ffw > 0.0 and torch.any(non_mask):
+                    ff_k = ((state[non_mask] - state_free[non_mask]) ** 2).mean(dim=1)  # (N_non,)
+                    mse_k[non_mask] = mse_k[non_mask] + ffw * ff_k
+
+                if svw > 0.0 and torch.any(non_mask):
+                    speed_next = torch.linalg.norm(state[:, 2:4], dim=1)
+                    sv_k = (speed_next[non_mask] - speed_prev[non_mask]) ** 2  # (N_non,)
+                    mse_k[non_mask] = mse_k[non_mask] + svw * sv_k
+
                 if cw != 1.0:
                     w = torch.where(coll_future[:, k] > 0, torch.full_like(mse_k, cw), torch.ones_like(mse_k))
                     mse_k = w * mse_k
                 step_losses.append(mse_k.mean())
                 pred_pos_seq.append(state[:, 0:2])
                 gt_pos_seq.append(gt_k[:, 0:2])
+
+                # --- train one-step metrics (unweighted) ---
+                train_mse_all_sum += mse_k_raw.sum().item()
+                train_n_all += mse_k_raw.numel()
+                if torch.any(col_mask):
+                    train_mse_col_sum += mse_k_raw[col_mask].sum().item()
+                    train_n_col += int(col_mask.sum().item())
+                if torch.any(non_mask):
+                    train_mse_non_sum += mse_k_raw[non_mask].sum().item()
+                    train_n_non += int(non_mask.sum().item())
 
             base_loss = torch.stack(step_losses).mean()
             if ulw > 0.0:
@@ -446,9 +496,15 @@ def train_multistep_1p(
 
         train_loss = running / max(n_samples, 1)
         train_unfold_loss = running_unfold / max(n_samples, 1)
+        train_mse_all = train_mse_all_sum / max(train_n_all, 1)
+        train_mse_collision = train_mse_col_sum / max(train_n_col, 1)
+        train_mse_noncollision = train_mse_non_sum / max(train_n_non, 1)
         stats = eval_loader(test_loader)
         history["train_loss"].append(train_loss)
         history["train_unfold_loss"].append(train_unfold_loss)
+        history["train_mse_all"].append(train_mse_all)
+        history["train_mse_collision"].append(train_mse_collision)
+        history["train_mse_noncollision"].append(train_mse_noncollision)
         history["test_mse_all"].append(stats["mse_all"])
         history["test_mse_collision"].append(stats["mse_collision"])
         history["test_mse_noncollision"].append(stats["mse_noncollision"])
@@ -463,6 +519,9 @@ def train_multistep_1p(
         print(
             f"Epoch {ep:03d} | train_loss={train_loss:.6f} "
             f"| train_unfold={train_unfold_loss:.6f} "
+            f"| train_mse={train_mse_all:.6f} "
+            f"| train_col={train_mse_collision:.6f} "
+            f"| train_noncol={train_mse_noncollision:.6f} "
             f"| test_mse={stats['mse_all']:.6f} "
             f"| test_collision={stats['mse_collision']:.6f} "
             f"| test_noncollision={stats['mse_noncollision']:.6f} "
@@ -475,6 +534,9 @@ def train_multistep_1p(
                     "epoch": ep,
                     "train_loss": train_loss,
                     "train_unfold_loss": train_unfold_loss,
+                    "train_mse_all": train_mse_all,
+                    "train_mse_collision": train_mse_collision,
+                    "train_mse_noncollision": train_mse_noncollision,
                     "test_mse_all": stats["mse_all"],
                     "test_mse_collision": stats["mse_collision"],
                     "test_mse_noncollision": stats["mse_noncollision"],
@@ -511,6 +573,10 @@ def main():
         raise ValueError("--angle-bins must be >= 1.")
     if args.episodes_per_bucket is not None and args.episodes_per_bucket <= 0:
         raise ValueError("--episodes-per-bucket must be >= 1 when provided.")
+    if args.freeflight_loss_weight < 0.0:
+        raise ValueError("--freeflight-loss-weight must be >= 0")
+    if args.speed_loss_weight < 0.0:
+        raise ValueError("--speed-loss-weight must be >= 0")
     if args.unfold_loss_weight < 0.0:
         raise ValueError("--unfold-loss-weight must be >= 0")
 
@@ -538,6 +604,8 @@ def main():
             "speed_max": args.speed_max,
             "fixed_speed": args.fixed_speed,
             "multistep_horizon": args.multistep_horizon,
+            "freeflight_loss_weight": args.freeflight_loss_weight,
+            "speed_loss_weight": args.speed_loss_weight,
             "unfold_loss_weight": args.unfold_loss_weight,
             "fixed_x": args.fixed_x,
             "fixed_y": args.fixed_y,
@@ -720,6 +788,8 @@ def main():
         mass=float(meta["masses"][0]),
         box_W=float(meta["W"]),
         box_H=float(meta["H"]),
+        freeflight_loss_weight=float(args.freeflight_loss_weight),
+        speed_loss_weight=float(args.speed_loss_weight),
         unfold_loss_weight=float(args.unfold_loss_weight),
         wandb_run=wandb_run,
     )
