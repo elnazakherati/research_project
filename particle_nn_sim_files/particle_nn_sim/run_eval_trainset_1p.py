@@ -137,6 +137,19 @@ def main():
             angle_bins=int(cfg.get("angle_bins", 8)),
             episodes_per_bucket=cfg.get("episodes_per_bucket", None),
             fixed_speed=cfg.get("fixed_speed", None),
+            fixed_x=cfg.get("fixed_x", None),
+            fixed_y=cfg.get("fixed_y", None),
+            fixed_vx=cfg.get("fixed_vx", None),
+            fixed_vy=cfg.get("fixed_vy", None),
+            fixed2_x=cfg.get("fixed2_x", None),
+            fixed2_y=cfg.get("fixed2_y", None),
+            fixed2_vx=cfg.get("fixed2_vx", None),
+            fixed2_vy=cfg.get("fixed2_vy", None),
+            ball_center_x=cfg.get("ball_center_x", None),
+            ball_center_y=cfg.get("ball_center_y", None),
+            ball_radius=cfg.get("ball_radius", None),
+            fixed_vel_vx=cfg.get("fixed_vel_vx", None),
+            fixed_vel_vy=cfg.get("fixed_vel_vy", None),
         )
         pos0_all = pos_all[:, 0].astype(np.float32)
         vel0_all = vel_all[:, 0].astype(np.float32)

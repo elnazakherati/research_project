@@ -66,6 +66,27 @@ def sample_init_1p_stratified(
     return pos[None, :], vel[None, :]
 
 
+def sample_pos_in_ball(W, H, radius, cx, cy, ball_radius, rng, max_tries=10000):
+    """
+    Sample one position uniformly in a disk, constrained to valid in-box particle centers.
+    """
+    x_min = radius
+    x_max = W - radius
+    y_min = radius
+    y_max = H - radius
+    for _ in range(int(max_tries)):
+        th = rng.uniform(0.0, 2.0 * np.pi)
+        rr = float(ball_radius) * np.sqrt(float(rng.uniform(0.0, 1.0)))
+        x = float(cx) + rr * np.cos(th)
+        y = float(cy) + rr * np.sin(th)
+        if x_min <= x <= x_max and y_min <= y <= y_max:
+            return np.array([x, y], dtype=np.float32)
+    raise RuntimeError(
+        "Could not sample a valid point in the requested ball. "
+        "Try reducing ball_radius or moving the center away from walls."
+    )
+
+
 def collect_episodes_1p(
     sim,
     E=300,
@@ -86,6 +107,11 @@ def collect_episodes_1p(
     fixed2_y=None,
     fixed2_vx=None,
     fixed2_vy=None,
+    ball_center_x=None,
+    ball_center_y=None,
+    ball_radius=None,
+    fixed_vel_vx=None,
+    fixed_vel_vy=None,
 ):
     rng = np.random.default_rng(seed)
     T = int(steps) + 1
@@ -100,6 +126,16 @@ def collect_episodes_1p(
 
     if fixed_speed is not None and float(fixed_speed) < 0.0:
         raise ValueError("fixed_speed must be >= 0 when provided")
+    fixed_vel_vals = (fixed_vel_vx, fixed_vel_vy)
+    use_fixed_vel = any(v is not None for v in fixed_vel_vals)
+    if use_fixed_vel and not all(v is not None for v in fixed_vel_vals):
+        raise ValueError("If any of fixed_vel_vx/fixed_vel_vy is provided, both must be provided.")
+    use_ball = any(v is not None for v in (ball_center_x, ball_center_y, ball_radius))
+    if use_ball and not all(v is not None for v in (ball_center_x, ball_center_y, ball_radius)):
+        raise ValueError("If using ball sampling, provide ball_center_x, ball_center_y, and ball_radius.")
+    if use_ball and float(ball_radius) < 0.0:
+        raise ValueError("ball_radius must be >= 0")
+
     fixed_ic_vals = (fixed_x, fixed_y, fixed_vx, fixed_vy)
     use_fixed_ic = any(v is not None for v in fixed_ic_vals)
     if use_fixed_ic and not all(v is not None for v in fixed_ic_vals):
@@ -134,9 +170,22 @@ def collect_episodes_1p(
         if not (radius <= fy2 <= H - radius):
             raise ValueError(f"fixed2_y={fy2} outside valid range [{radius}, {H-radius}]")
 
+    if use_ball:
+        cx = float(ball_center_x)
+        cy = float(ball_center_y)
+        br = float(ball_radius)
+        if not (radius <= cx <= W - radius):
+            raise ValueError(f"ball_center_x={cx} outside valid range [{radius}, {W-radius}]")
+        if not (radius <= cy <= H - radius):
+            raise ValueError(f"ball_center_y={cy} outside valid range [{radius}, {H-radius}]")
+        if bool(stratified_init):
+            raise ValueError("ball sampling cannot be combined with stratified_init.")
+        if use_fixed_ic:
+            raise ValueError("ball sampling cannot be combined with fixed_x/fixed_y/fixed_vx/fixed_vy mode.")
+
     # Optional stratified schedule over (position-cell, angle-bin) buckets.
     bucket_schedule = None
-    if bool(stratified_init) and not use_fixed_ic:
+    if bool(stratified_init) and not use_fixed_ic and not use_ball:
         g = int(pos_grid_n)
         a = int(angle_bins)
         if g < 1 or a < 1:
@@ -183,6 +232,19 @@ def collect_episodes_1p(
             else:
                 pos0 = np.array([[fx, fy]], dtype=np.float32)
                 vel0 = np.array([[fvx, fvy]], dtype=np.float32)
+        elif use_ball:
+            p = sample_pos_in_ball(W=W, H=H, radius=radius, cx=cx, cy=cy, ball_radius=br, rng=rng)
+            pos0 = p[None, :]
+            if use_fixed_vel:
+                vel0 = np.array([[float(fixed_vel_vx), float(fixed_vel_vy)]], dtype=np.float32)
+            elif fixed_speed is not None:
+                th = rng.uniform(0.0, 2.0 * np.pi)
+                s = float(fixed_speed)
+                vel0 = np.array([[s * np.cos(th), s * np.sin(th)]], dtype=np.float32)
+            else:
+                th = rng.uniform(0.0, 2.0 * np.pi)
+                mag = rng.uniform(0.0, float(speed_max))
+                vel0 = np.array([[mag * np.cos(th), mag * np.sin(th)]], dtype=np.float32)
         elif bucket_schedule is None:
             pos0, vel0 = sample_init_1p(
                 W,
@@ -195,6 +257,8 @@ def collect_episodes_1p(
                 theta = np.arctan2(float(vel0[0, 1]), float(vel0[0, 0]))
                 s = float(fixed_speed)
                 vel0 = np.array([[s * np.cos(theta), s * np.sin(theta)]], dtype=np.float32)
+            if use_fixed_vel:
+                vel0 = np.array([[float(fixed_vel_vx), float(fixed_vel_vy)]], dtype=np.float32)
         else:
             ix, iy, ia = bucket_schedule[e]
             pos0, vel0 = sample_init_1p_stratified(
@@ -209,6 +273,8 @@ def collect_episodes_1p(
                 fixed_speed=fixed_speed,
                 rng=rng,
             )
+            if use_fixed_vel:
+                vel0 = np.array([[float(fixed_vel_vx), float(fixed_vel_vy)]], dtype=np.float32)
         sim.reset(pos0, vel0)
 
         pos_traj, vel_traj = sim.rollout(dt=dt, steps=steps)
@@ -247,6 +313,11 @@ def collect_episodes_1p(
         "fixed2_y": None if fixed2_y is None else float(fixed2_y),
         "fixed2_vx": None if fixed2_vx is None else float(fixed2_vx),
         "fixed2_vy": None if fixed2_vy is None else float(fixed2_vy),
+        "ball_center_x": None if ball_center_x is None else float(ball_center_x),
+        "ball_center_y": None if ball_center_y is None else float(ball_center_y),
+        "ball_radius": None if ball_radius is None else float(ball_radius),
+        "fixed_vel_vx": None if fixed_vel_vx is None else float(fixed_vel_vx),
+        "fixed_vel_vy": None if fixed_vel_vy is None else float(fixed_vel_vy),
     }
     return pos_all, vel_all, coll_all, meta
 

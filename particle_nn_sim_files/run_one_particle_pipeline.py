@@ -61,6 +61,11 @@ def parse_args():
     p.add_argument("--fixed2-y", type=float, default=None, help="Optional second fixed initial y (alternating episodes).")
     p.add_argument("--fixed2-vx", type=float, default=None, help="Optional second fixed initial vx (alternating episodes).")
     p.add_argument("--fixed2-vy", type=float, default=None, help="Optional second fixed initial vy (alternating episodes).")
+    p.add_argument("--ball-center-x", type=float, default=None, help="If set with --ball-center-y/--ball-radius, sample initial x,y uniformly inside this ball.")
+    p.add_argument("--ball-center-y", type=float, default=None, help="If set with --ball-center-x/--ball-radius, sample initial x,y uniformly inside this ball.")
+    p.add_argument("--ball-radius", type=float, default=None, help="Radius of random initial-position sampling ball.")
+    p.add_argument("--fixed-vel-vx", type=float, default=None, help="Optional fixed initial vx across all episodes (supports ball/random modes).")
+    p.add_argument("--fixed-vel-vy", type=float, default=None, help="Optional fixed initial vy across all episodes (supports ball/random modes).")
     p.add_argument(
         "--stratified-init",
         type=str2bool,
@@ -567,6 +572,12 @@ def main():
         raise ValueError("If any of --fixed2-x/--fixed2-y/--fixed2-vx/--fixed2-vy is set, all four must be set.")
     if any(v is not None for v in fixed2_ic_vals) and not all(v is not None for v in fixed_ic_vals):
         raise ValueError("--fixed2-* requires --fixed-* (IC1) to be set.")
+    ball_vals = (args.ball_center_x, args.ball_center_y, args.ball_radius)
+    if any(v is not None for v in ball_vals) and not all(v is not None for v in ball_vals):
+        raise ValueError("If any of --ball-center-x/--ball-center-y/--ball-radius is set, all three must be set.")
+    fixed_vel_vals = (args.fixed_vel_vx, args.fixed_vel_vy)
+    if any(v is not None for v in fixed_vel_vals) and not all(v is not None for v in fixed_vel_vals):
+        raise ValueError("If any of --fixed-vel-vx/--fixed-vel-vy is set, both must be set.")
     if args.pos_grid_n <= 0:
         raise ValueError("--pos-grid-n must be >= 1.")
     if args.angle_bins <= 0:
@@ -615,6 +626,11 @@ def main():
             "fixed2_y": args.fixed2_y,
             "fixed2_vx": args.fixed2_vx,
             "fixed2_vy": args.fixed2_vy,
+            "ball_center_x": args.ball_center_x,
+            "ball_center_y": args.ball_center_y,
+            "ball_radius": args.ball_radius,
+            "fixed_vel_vx": args.fixed_vel_vx,
+            "fixed_vel_vy": args.fixed_vel_vy,
             "collision_weight": args.collision_weight,
             "rebalance_sampling": args.rebalance_sampling,
             "target_collision_frac": args.target_collision_frac,
@@ -661,6 +677,11 @@ def main():
         fixed2_y=args.fixed2_y,
         fixed2_vx=args.fixed2_vx,
         fixed2_vy=args.fixed2_vy,
+        ball_center_x=args.ball_center_x,
+        ball_center_y=args.ball_center_y,
+        ball_radius=args.ball_radius,
+        fixed_vel_vx=args.fixed_vel_vx,
+        fixed_vel_vy=args.fixed_vel_vy,
     )
     print(
         f"Generated episodes: pos_all={pos_all.shape}, vel_all={vel_all.shape}, "
