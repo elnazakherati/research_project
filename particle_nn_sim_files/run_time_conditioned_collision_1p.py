@@ -29,8 +29,9 @@ from particle_nn_sim.time_conditioned_collision_model import (
 @dataclass
 class LossWeights:
     lambda_pos: float = 1.0
-    lambda_vel: float = 2.0
-    lambda_event: float = 0.5
+    lambda_vel: float = 3.0
+    lambda_event: float = 1.0
+    lambda_sign: float = 1.0
 
 
 @dataclass
@@ -56,8 +57,9 @@ class DataConfig:
     mass: float = 1.0
     wall_collision_mode: str = "clamp"
     coll_epsilon_steps: int = 2
-    sampling_mode: str = "uniform"  # {"uniform","collision_aware"}
-    collision_oversample_factor: int = 4
+    use_collision_oversampling: bool = True
+    collision_sample_fraction: float = 0.6
+    collision_window: float = 0.03
     # Optional IC controls to match existing workflows.
     fixed_x: float | None = None
     fixed_y: float | None = None
@@ -83,6 +85,7 @@ class RunConfig:
     out_dir: str = "checkpoints/tc_collision_1p"
     plot_episode_idx: int = 0
     event_prob_threshold: float = 0.5
+    sign_epsilon: float = 1e-6
 
 
 class Standardizer:
@@ -218,8 +221,9 @@ def build_query_samples(
     dt: float,
     episode_indices: np.ndarray,
     eps_steps: int,
-    sampling_mode: str = "uniform",
-    collision_oversample_factor: int = 4,
+    use_collision_oversampling: bool = True,
+    collision_sample_fraction: float = 0.6,
+    collision_window: float = 0.03,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Builds samples:
@@ -243,15 +247,27 @@ def build_query_samples(
         states = np.concatenate([pos_ep[:, 0, :], vel_ep[:, 0, :]], axis=1).astype(np.float32)  # (T,4)
         t_query = (np.arange(T, dtype=np.float32) * float(dt)).astype(np.float32)  # (T,)
 
-        if sampling_mode == "collision_aware":
-            idx_all = np.arange(T, dtype=np.int64)
-            idx_pos = idx_all[near_event > 0.5]
-            if len(idx_pos) > 0 and collision_oversample_factor > 1:
-                idx_use = np.concatenate([idx_all, np.repeat(idx_pos, collision_oversample_factor - 1)], axis=0)
+        idx_all = np.arange(T, dtype=np.int64)
+        if use_collision_oversampling and len(collision_steps) > 0:
+            window_steps = int(np.ceil(float(collision_window) / float(dt)))
+            near_mask = np.zeros((T,), dtype=bool)
+            for c in collision_steps:
+                lo = int(max(0, int(c) - window_steps))
+                hi = int(min(T - 1, int(c) + window_steps))
+                near_mask[lo : hi + 1] = True
+            near_idx = idx_all[near_mask]
+            if len(near_idx) > 0:
+                n_total = T
+                n_coll = int(np.round(float(collision_sample_fraction) * n_total))
+                n_coll = int(np.clip(n_coll, 0, n_total))
+                n_uni = n_total - n_coll
+                coll_draw = np.random.choice(near_idx, size=n_coll, replace=True) if n_coll > 0 else np.empty((0,), dtype=np.int64)
+                uni_draw = np.random.choice(idx_all, size=n_uni, replace=True) if n_uni > 0 else np.empty((0,), dtype=np.int64)
+                idx_use = np.concatenate([coll_draw, uni_draw], axis=0)
             else:
                 idx_use = idx_all
         else:
-            idx_use = np.arange(T, dtype=np.int64)
+            idx_use = idx_all
 
         s0_rep = np.repeat(s0[None, :], len(idx_use), axis=0)
         s0_list.append(s0_rep)
@@ -268,7 +284,7 @@ def build_query_samples(
 
 
 def compute_event_metrics(logits: np.ndarray, labels: np.ndarray, threshold: float = 0.5) -> dict[str, float]:
-    probs = 1.0 / (1.0 + np.exp(-logits))
+    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -60.0, 60.0)))
     pred = probs >= float(threshold)
     y = labels >= 0.5
     tp = int(np.sum(pred & y))
@@ -285,6 +301,27 @@ def compute_event_metrics(logits: np.ndarray, labels: np.ndarray, threshold: flo
     }
 
 
+def compute_sign_accuracy(pred_vel: np.ndarray, true_vel: np.ndarray, sign_epsilon: float = 1e-6) -> dict[str, float]:
+    mask_x = np.abs(true_vel[:, 0]) > float(sign_epsilon)
+    mask_y = np.abs(true_vel[:, 1]) > float(sign_epsilon)
+    pred_x = pred_vel[:, 0] >= 0.0
+    pred_y = pred_vel[:, 1] >= 0.0
+    true_x = true_vel[:, 0] >= 0.0
+    true_y = true_vel[:, 1] >= 0.0
+    acc_x = float(np.mean(pred_x[mask_x] == true_x[mask_x])) if np.any(mask_x) else 1.0
+    acc_y = float(np.mean(pred_y[mask_y] == true_y[mask_y])) if np.any(mask_y) else 1.0
+    return {"sign_acc_vx": acc_x, "sign_acc_vy": acc_y}
+
+
+def velocity_sign_loss(pred_vel: Tensor, true_vel: Tensor, sign_epsilon: float = 1e-6) -> Tensor:
+    mask = torch.abs(true_vel) > float(sign_epsilon)
+    if not torch.any(mask):
+        return pred_vel.new_zeros(())
+    logits = pred_vel[mask]
+    target = (true_vel[mask] >= 0.0).to(dtype=pred_vel.dtype)
+    return F.binary_cross_entropy_with_logits(logits, target)
+
+
 @torch.no_grad()
 def evaluate(
     model: TimeConditionedCollisionModel,
@@ -292,6 +329,7 @@ def evaluate(
     device: str,
     state_std: Standardizer | None,
     event_threshold: float = 0.5,
+    sign_epsilon: float = 1e-6,
 ) -> dict[str, float]:
     model.eval()
     state_preds: list[np.ndarray] = []
@@ -304,7 +342,9 @@ def evaluate(
         t_q = t_q.to(device)
         y_state = y_state.to(device)
         y_event = y_event.to(device)
-        pred_state, logit = model(s0, t_q)
+        out = model(s0, t_q)
+        pred_state = out["state"]
+        logit = out["event_logit"]
         state_preds.append(pred_state.cpu().numpy())
         state_targets.append(y_state.cpu().numpy())
         event_logits.append(logit.squeeze(1).cpu().numpy())
@@ -323,11 +363,13 @@ def evaluate(
     vel_mse = float(np.mean((pred_s[:, 2:] - true_s[:, 2:]) ** 2))
     state_mse = float(np.mean((pred_s - true_s) ** 2))
     evt = compute_event_metrics(logits=logits, labels=y_evt, threshold=event_threshold)
+    sign_metrics = compute_sign_accuracy(pred_s[:, 2:], true_s[:, 2:], sign_epsilon=sign_epsilon)
     return {
         "state_mse": state_mse,
         "position_mse": pos_mse,
         "velocity_mse": vel_mse,
         **evt,
+        **sign_metrics,
     }
 
 
@@ -337,9 +379,11 @@ def plot_state_and_event_over_time(
     pred_state: np.ndarray,
     event_prob: np.ndarray,
     event_target: np.ndarray,
+    gate: np.ndarray | None,
     out_path: Path,
 ) -> None:
-    fig, axs = plt.subplots(5, 1, figsize=(10, 12), sharex=True)
+    n_rows = 6 if gate is not None else 5
+    fig, axs = plt.subplots(n_rows, 1, figsize=(10, 14 if gate is not None else 12), sharex=True)
     labels = ["x(t)", "y(t)", "vx(t)", "vy(t)"]
     for i in range(4):
         axs[i].plot(t_query, true_state[:, i], lw=2, label="true")
@@ -348,13 +392,23 @@ def plot_state_and_event_over_time(
         axs[i].grid(True, alpha=0.3)
         if i == 0:
             axs[i].legend(loc="best")
-    axs[4].plot(t_query, event_prob, lw=2, label="pred event prob")
-    axs[4].plot(t_query, event_target, lw=1.5, alpha=0.75, label="event target")
-    axs[4].set_ylabel("event")
-    axs[4].set_xlabel("time (s)")
-    axs[4].set_ylim([-0.05, 1.05])
-    axs[4].grid(True, alpha=0.3)
-    axs[4].legend(loc="best")
+    evt_ax = axs[4]
+    evt_ax.plot(t_query, event_prob, lw=2, label="pred event prob")
+    evt_ax.plot(t_query, event_target, lw=1.5, alpha=0.75, label="event target")
+    evt_ax.set_ylabel("event")
+    evt_ax.set_ylim([-0.05, 1.05])
+    evt_ax.grid(True, alpha=0.3)
+    evt_ax.legend(loc="best")
+    if gate is not None:
+        gate_ax = axs[5]
+        gate_ax.plot(t_query, gate, lw=2, label="gate(t)")
+        gate_ax.set_ylabel("gate")
+        gate_ax.set_xlabel("time (s)")
+        gate_ax.set_ylim([-0.05, 1.05])
+        gate_ax.grid(True, alpha=0.3)
+        gate_ax.legend(loc="best")
+    else:
+        evt_ax.set_xlabel("time (s)")
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -373,8 +427,9 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--mass", type=float, default=1.0)
     p.add_argument("--wall-collision-mode", type=str, default="clamp", choices=["clamp", "exact"])
     p.add_argument("--coll-epsilon-steps", type=int, default=2)
-    p.add_argument("--sampling-mode", type=str, default="uniform", choices=["uniform", "collision_aware"])
-    p.add_argument("--collision-oversample-factor", type=int, default=4)
+    p.add_argument("--use-collision-oversampling", type=str2bool, default=True)
+    p.add_argument("--collision-sample-fraction", type=float, default=0.6)
+    p.add_argument("--collision-window", type=float, default=0.03)
 
     p.add_argument("--fixed-x", type=float, default=None)
     p.add_argument("--fixed-y", type=float, default=None)
@@ -400,11 +455,13 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--trunk-depth", type=int, default=3)
     p.add_argument("--activation", type=str, default="gelu", choices=["gelu", "silu"])
     p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--alpha-gate", type=float, default=5.0)
 
     # Loss.
     p.add_argument("--lambda-pos", type=float, default=1.0)
-    p.add_argument("--lambda-vel", type=float, default=2.0)
-    p.add_argument("--lambda-event", type=float, default=0.5)
+    p.add_argument("--lambda-vel", type=float, default=3.0)
+    p.add_argument("--lambda-event", type=float, default=1.0)
+    p.add_argument("--lambda-sign", type=float, default=1.0)
 
     # Train.
     p.add_argument("--epochs", type=int, default=200)
@@ -418,6 +475,7 @@ def make_parser() -> argparse.ArgumentParser:
 
     # Eval/plots.
     p.add_argument("--event-prob-threshold", type=float, default=0.5)
+    p.add_argument("--sign-epsilon", type=float, default=1e-6)
     p.add_argument("--plot-episode-idx", type=int, default=0)
     p.add_argument("--out-dir", type=str, default="checkpoints/tc_collision_1p")
     p.add_argument("--use-wandb", type=str2bool, default=False)
@@ -432,8 +490,10 @@ def main() -> None:
     args = make_parser().parse_args()
     if args.coll_epsilon_steps < 0:
         raise ValueError("--coll-epsilon-steps must be >= 0")
-    if args.collision_oversample_factor < 1:
-        raise ValueError("--collision-oversample-factor must be >= 1")
+    if not (0.0 <= args.collision_sample_fraction <= 1.0):
+        raise ValueError("--collision-sample-fraction must be in [0,1]")
+    if args.collision_window < 0.0:
+        raise ValueError("--collision-window must be >= 0")
     if not (0.0 < args.train_split < 1.0):
         raise ValueError("--train-split must be in (0,1)")
     if not (0.0 <= args.val_split < 1.0):
@@ -458,8 +518,9 @@ def main() -> None:
         mass=args.mass,
         wall_collision_mode=args.wall_collision_mode,
         coll_epsilon_steps=args.coll_epsilon_steps,
-        sampling_mode=args.sampling_mode,
-        collision_oversample_factor=args.collision_oversample_factor,
+        use_collision_oversampling=args.use_collision_oversampling,
+        collision_sample_fraction=args.collision_sample_fraction,
+        collision_window=args.collision_window,
         fixed_x=args.fixed_x,
         fixed_y=args.fixed_y,
         fixed_vx=args.fixed_vx,
@@ -488,11 +549,17 @@ def main() -> None:
         val_split=args.val_split,
         normalize=args.normalize,
     )
-    lw = LossWeights(lambda_pos=args.lambda_pos, lambda_vel=args.lambda_vel, lambda_event=args.lambda_event)
+    lw = LossWeights(
+        lambda_pos=args.lambda_pos,
+        lambda_vel=args.lambda_vel,
+        lambda_event=args.lambda_event,
+        lambda_sign=args.lambda_sign,
+    )
     run_cfg = RunConfig(
         out_dir=str(out_dir),
         plot_episode_idx=args.plot_episode_idx,
         event_prob_threshold=args.event_prob_threshold,
+        sign_epsilon=args.sign_epsilon,
     )
     model_cfg = TimeConditionedCollisionModelConfig(
         state_dim=4,
@@ -500,6 +567,7 @@ def main() -> None:
         trunk_depth=args.trunk_depth,
         activation=args.activation,
         dropout=args.dropout,
+        alpha_gate=args.alpha_gate,
         time_encoding=TimeEncodingConfig(num_frequencies=args.num_frequencies),
     )
     print("Config:")
@@ -513,6 +581,7 @@ def main() -> None:
                 "trunk_depth": model_cfg.trunk_depth,
                 "activation": model_cfg.activation,
                 "dropout": model_cfg.dropout,
+                "alpha_gate": model_cfg.alpha_gate,
                 "num_frequencies": model_cfg.time_encoding.num_frequencies,
             },
         }
@@ -614,8 +683,9 @@ def main() -> None:
         dt=meta["dt"],
         episode_indices=train_eps,
         eps_steps=data_cfg.coll_epsilon_steps,
-        sampling_mode=data_cfg.sampling_mode,
-        collision_oversample_factor=data_cfg.collision_oversample_factor,
+        use_collision_oversampling=data_cfg.use_collision_oversampling,
+        collision_sample_fraction=data_cfg.collision_sample_fraction,
+        collision_window=data_cfg.collision_window,
     )
     X0_val, Tq_val, Y_val, Evt_val = build_query_samples(
         pos_all=pos_all,
@@ -624,8 +694,9 @@ def main() -> None:
         dt=meta["dt"],
         episode_indices=val_eps,
         eps_steps=data_cfg.coll_epsilon_steps,
-        sampling_mode="uniform",
-        collision_oversample_factor=1,
+        use_collision_oversampling=False,
+        collision_sample_fraction=data_cfg.collision_sample_fraction,
+        collision_window=data_cfg.collision_window,
     )
     X0_te, Tq_te, Y_te, Evt_te = build_query_samples(
         pos_all=pos_all,
@@ -634,8 +705,9 @@ def main() -> None:
         dt=meta["dt"],
         episode_indices=test_eps,
         eps_steps=data_cfg.coll_epsilon_steps,
-        sampling_mode="uniform",
-        collision_oversample_factor=1,
+        use_collision_oversampling=False,
+        collision_sample_fraction=data_cfg.collision_sample_fraction,
+        collision_window=data_cfg.collision_window,
     )
     print(
         f"Sample counts: train={len(X0_tr)} val={len(X0_val)} test={len(X0_te)} "
@@ -670,6 +742,7 @@ def main() -> None:
         "train_pos_mse_loss": [],
         "train_vel_mse_loss": [],
         "train_event_bce_loss": [],
+        "train_sign_bce_loss": [],
         "val_state_mse": [],
         "val_position_mse": [],
         "val_velocity_mse": [],
@@ -684,6 +757,7 @@ def main() -> None:
         run_pos = 0.0
         run_vel = 0.0
         run_evt = 0.0
+        run_sign = 0.0
         n_batches = 0
         for s0, t_q, y_state, y_event in train_loader:
             s0 = s0.to(device)
@@ -691,11 +765,19 @@ def main() -> None:
             y_state = y_state.to(device)
             y_event = y_event.to(device)
 
-            pred_state, evt_logit = model(s0, t_q)
+            out = model(s0, t_q)
+            pred_state = out["state"]
+            evt_logit = out["event_logit"]
             pos_mse = F.mse_loss(pred_state[:, :2], y_state[:, :2])
             vel_mse = F.mse_loss(pred_state[:, 2:], y_state[:, 2:])
             evt_bce = F.binary_cross_entropy_with_logits(evt_logit.squeeze(1), y_event)
-            loss = lw.lambda_pos * pos_mse + lw.lambda_vel * vel_mse + lw.lambda_event * evt_bce
+            sign_bce = velocity_sign_loss(pred_state[:, 2:], y_state[:, 2:], sign_epsilon=run_cfg.sign_epsilon)
+            loss = (
+                lw.lambda_pos * pos_mse
+                + lw.lambda_vel * vel_mse
+                + lw.lambda_event * evt_bce
+                + lw.lambda_sign * sign_bce
+            )
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -706,12 +788,14 @@ def main() -> None:
             run_pos += float(pos_mse.item())
             run_vel += float(vel_mse.item())
             run_evt += float(evt_bce.item())
+            run_sign += float(sign_bce.item())
             n_batches += 1
 
         train_total = run_total / max(1, n_batches)
         train_pos = run_pos / max(1, n_batches)
         train_vel = run_vel / max(1, n_batches)
         train_evt = run_evt / max(1, n_batches)
+        train_sign = run_sign / max(1, n_batches)
 
         val_metrics = evaluate(
             model=model,
@@ -719,6 +803,7 @@ def main() -> None:
             device=device,
             state_std=y_std,
             event_threshold=run_cfg.event_prob_threshold,
+            sign_epsilon=run_cfg.sign_epsilon,
         )
         test_metrics = evaluate(
             model=model,
@@ -726,12 +811,14 @@ def main() -> None:
             device=device,
             state_std=y_std,
             event_threshold=run_cfg.event_prob_threshold,
+            sign_epsilon=run_cfg.sign_epsilon,
         )
 
         history["train_total_loss"].append(train_total)
         history["train_pos_mse_loss"].append(train_pos)
         history["train_vel_mse_loss"].append(train_vel)
         history["train_event_bce_loss"].append(train_evt)
+        history["train_sign_bce_loss"].append(train_sign)
         history["val_state_mse"].append(val_metrics["state_mse"])
         history["val_position_mse"].append(val_metrics["position_mse"])
         history["val_velocity_mse"].append(val_metrics["velocity_mse"])
@@ -750,25 +837,30 @@ def main() -> None:
                     "train_pos_mse_loss": train_pos,
                     "train_vel_mse_loss": train_vel,
                     "train_event_bce_loss": train_evt,
+                    "train_sign_bce_loss": train_sign,
                     "val_state_mse": val_metrics["state_mse"],
                     "val_position_mse": val_metrics["position_mse"],
                     "val_velocity_mse": val_metrics["velocity_mse"],
                     "val_event_accuracy": val_metrics["event_accuracy"],
                     "val_event_precision": val_metrics["event_precision"],
                     "val_event_recall": val_metrics["event_recall"],
+                    "val_sign_acc_vx": val_metrics["sign_acc_vx"],
+                    "val_sign_acc_vy": val_metrics["sign_acc_vy"],
                     "test_state_mse": test_metrics["state_mse"],
                     "test_position_mse": test_metrics["position_mse"],
                     "test_velocity_mse": test_metrics["velocity_mse"],
                     "test_event_accuracy": test_metrics["event_accuracy"],
                     "test_event_precision": test_metrics["event_precision"],
                     "test_event_recall": test_metrics["event_recall"],
+                    "test_sign_acc_vx": test_metrics["sign_acc_vx"],
+                    "test_sign_acc_vy": test_metrics["sign_acc_vy"],
                     "best_val_state_mse_so_far": best["val_state_mse"],
                     "best_epoch_so_far": best["epoch"],
                 }
             )
 
         print(
-            f"Epoch {ep:04d} | train_total={train_total:.6f} pos={train_pos:.6f} vel={train_vel:.6f} evt={train_evt:.6f} "
+            f"Epoch {ep:04d} | train_total={train_total:.6f} pos={train_pos:.6f} vel={train_vel:.6f} evt={train_evt:.6f} sign={train_sign:.6f} "
             f"| val_state={val_metrics['state_mse']:.6f} val_evt_acc={val_metrics['event_accuracy']:.4f} "
             f"| test_state={test_metrics['state_mse']:.6f} test_evt_acc={test_metrics['event_accuracy']:.4f} "
             f"| best_epoch={best['epoch']}"
@@ -778,9 +870,9 @@ def main() -> None:
         model.load_state_dict(best["state_dict"])
 
     # Final metrics using best-by-val model.
-    final_train = evaluate(model, train_loader, device, y_std, run_cfg.event_prob_threshold)
-    final_val = evaluate(model, val_loader, device, y_std, run_cfg.event_prob_threshold)
-    final_test = evaluate(model, test_loader, device, y_std, run_cfg.event_prob_threshold)
+    final_train = evaluate(model, train_loader, device, y_std, run_cfg.event_prob_threshold, run_cfg.sign_epsilon)
+    final_val = evaluate(model, val_loader, device, y_std, run_cfg.event_prob_threshold, run_cfg.sign_epsilon)
+    final_test = evaluate(model, test_loader, device, y_std, run_cfg.event_prob_threshold, run_cfg.sign_epsilon)
 
     # Visualization for one test episode.
     plot_ep_local = int(np.clip(run_cfg.plot_episode_idx, 0, len(test_eps) - 1))
@@ -803,11 +895,12 @@ def main() -> None:
     with torch.no_grad():
         s0_t = torch.from_numpy(s0_batch).to(device)
         tq_t = torch.from_numpy(t_q).to(device)
-        pred_state_n, evt_logit = model(s0_t, tq_t)
-        pred_state = pred_state_n.cpu().numpy().astype(np.float32)
+        out = model(s0_t, tq_t)
+        pred_state = out["state"].cpu().numpy().astype(np.float32)
         if y_std is not None:
             pred_state = y_std.inverse(pred_state)
-        evt_prob = torch.sigmoid(evt_logit.squeeze(1)).cpu().numpy().astype(np.float32)
+        evt_prob = torch.sigmoid(out["event_logit"].squeeze(1)).cpu().numpy().astype(np.float32)
+        gate_np = out["gate"].squeeze(1).cpu().numpy().astype(np.float32)
 
     plot_state_and_event_over_time(
         t_query=t_q,
@@ -815,6 +908,7 @@ def main() -> None:
         pred_state=pred_state,
         event_prob=evt_prob,
         event_target=evt_true,
+        gate=gate_np,
         out_path=out_dir / "state_and_event_vs_time.png",
     )
 
@@ -855,6 +949,7 @@ def main() -> None:
                 "trunk_depth": model_cfg.trunk_depth,
                 "activation": model_cfg.activation,
                 "dropout": model_cfg.dropout,
+                "alpha_gate": model_cfg.alpha_gate,
                 "num_frequencies": model_cfg.time_encoding.num_frequencies,
             },
         },
@@ -870,6 +965,7 @@ def main() -> None:
             "trunk_depth": model_cfg.trunk_depth,
             "activation": model_cfg.activation,
             "dropout": model_cfg.dropout,
+            "alpha_gate": model_cfg.alpha_gate,
             "num_frequencies": model_cfg.time_encoding.num_frequencies,
         },
         "model_state_dict": model.state_dict(),

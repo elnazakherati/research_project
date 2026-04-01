@@ -71,7 +71,7 @@ def build_near_collision_labels(T: int, collision_steps: np.ndarray, eps_steps: 
 
 
 def compute_event_metrics(logits: np.ndarray, labels: np.ndarray, threshold: float = 0.5) -> dict[str, float]:
-    probs = 1.0 / (1.0 + np.exp(-logits))
+    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -60.0, 60.0)))
     pred = probs >= float(threshold)
     y = labels >= 0.5
     tp = int(np.sum(pred & y))
@@ -86,6 +86,18 @@ def compute_event_metrics(logits: np.ndarray, labels: np.ndarray, threshold: flo
         "event_precision": float(prec),
         "event_recall": float(rec),
     }
+
+
+def compute_sign_accuracy(pred_vel: np.ndarray, true_vel: np.ndarray, sign_epsilon: float = 1e-6) -> dict[str, float]:
+    mask_x = np.abs(true_vel[:, 0]) > float(sign_epsilon)
+    mask_y = np.abs(true_vel[:, 1]) > float(sign_epsilon)
+    pred_x = pred_vel[:, 0] >= 0.0
+    pred_y = pred_vel[:, 1] >= 0.0
+    true_x = true_vel[:, 0] >= 0.0
+    true_y = true_vel[:, 1] >= 0.0
+    acc_x = float(np.mean(pred_x[mask_x] == true_x[mask_x])) if np.any(mask_x) else 1.0
+    acc_y = float(np.mean(pred_y[mask_y] == true_y[mask_y])) if np.any(mask_y) else 1.0
+    return {"sign_acc_vx": acc_x, "sign_acc_vy": acc_y}
 
 
 def parse_args() -> argparse.Namespace:
@@ -110,6 +122,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-side-by-side", type=str2bool, default=False)
     p.add_argument("--fps", type=int, default=50)
     p.add_argument("--frame-stride", type=int, default=1)
+    p.add_argument("--sign-epsilon", type=float, default=1e-6)
     p.add_argument("--out-dir", type=str, default="checkpoints/eval_tc_collision_1p")
     return p.parse_args()
 
@@ -142,6 +155,7 @@ def main() -> None:
         trunk_depth=int(model_cfg_raw["trunk_depth"]),
         activation=str(model_cfg_raw["activation"]),
         dropout=float(model_cfg_raw["dropout"]),
+        alpha_gate=float(model_cfg_raw.get("alpha_gate", 5.0)),
         time_encoding=TimeEncodingConfig(num_frequencies=int(model_cfg_raw["num_frequencies"])),
     )
     model = TimeConditionedCollisionModel(model_cfg)
@@ -232,6 +246,7 @@ def main() -> None:
     all_true_state: list[np.ndarray] = []
     all_evt_logits: list[np.ndarray] = []
     all_evt_true: list[np.ndarray] = []
+    all_gate: list[np.ndarray] = []
 
     eps_steps = int(data_cfg.get("coll_epsilon_steps", 2))
 
@@ -264,11 +279,14 @@ def main() -> None:
         with torch.no_grad():
             s0_t = torch.from_numpy(s0_batch).to(device)
             tq_t = torch.from_numpy(t_query).to(device)
-            pred_state_n, evt_logit = model(s0_t, tq_t)
-            pred_state = pred_state_n.cpu().numpy().astype(np.float32)
+            out = model(s0_t, tq_t)
+            pred_state = out["state"].cpu().numpy().astype(np.float32)
             if y_mean is not None and y_std is not None:
                 pred_state = (pred_state * y_std + y_mean).astype(np.float32)
-            evt_logit_np = evt_logit.squeeze(1).cpu().numpy().astype(np.float32)
+            evt_logit_np = out["event_logit"].squeeze(1).cpu().numpy().astype(np.float32)
+            gate_np = out["gate"].squeeze(1).cpu().numpy().astype(np.float32)
+            v_pre_np = out["v_pre"].cpu().numpy().astype(np.float32)
+            v_post_np = out["v_post"].cpu().numpy().astype(np.float32)
 
         true_state = np.concatenate([pos_true[:, 0, :], vel_true[:, 0, :]], axis=1).astype(np.float32)
         coll_steps = extract_collision_steps(coll_all[e], vel_true)
@@ -330,9 +348,10 @@ def main() -> None:
             axs[0].plot(np.arange(T), pos_err, lw=2, color="tab:red")
             axs[0].set_ylabel("||x_pred-x_true||")
             axs[0].grid(True, alpha=0.3)
-            evt_prob = 1.0 / (1.0 + np.exp(-evt_logit_np))
+            evt_prob = 1.0 / (1.0 + np.exp(-np.clip(evt_logit_np, -60.0, 60.0)))
             axs[1].plot(np.arange(T), evt_prob, lw=2, label="pred p(event)")
             axs[1].plot(np.arange(T), evt_true, lw=1.5, alpha=0.75, label="target event")
+            axs[1].plot(np.arange(T), gate_np, lw=1.7, alpha=0.9, label="gate")
             axs[1].set_ylabel("event")
             axs[1].set_xlabel("step")
             axs[1].set_ylim([-0.05, 1.05])
@@ -344,11 +363,34 @@ def main() -> None:
             plt.close(fig)
             row["error_event_plot"] = plot_path.name
 
+            fig_dbg, dbg_axs = plt.subplots(3, 1, figsize=(8, 7), sharex=True)
+            dbg_axs[0].plot(np.arange(T), v_pre_np[:, 0], label="v_pre_x", alpha=0.9)
+            dbg_axs[0].plot(np.arange(T), v_post_np[:, 0], label="v_post_x", alpha=0.9)
+            dbg_axs[0].plot(np.arange(T), true_state[:, 2], label="true_vx", lw=1.8)
+            dbg_axs[0].legend(loc="best")
+            dbg_axs[0].grid(True, alpha=0.3)
+            dbg_axs[1].plot(np.arange(T), v_pre_np[:, 1], label="v_pre_y", alpha=0.9)
+            dbg_axs[1].plot(np.arange(T), v_post_np[:, 1], label="v_post_y", alpha=0.9)
+            dbg_axs[1].plot(np.arange(T), true_state[:, 3], label="true_vy", lw=1.8)
+            dbg_axs[1].legend(loc="best")
+            dbg_axs[1].grid(True, alpha=0.3)
+            dbg_axs[2].plot(np.arange(T), gate_np, label="gate", lw=1.8)
+            dbg_axs[2].plot(np.arange(T), evt_true, label="event target", lw=1.4, alpha=0.8)
+            dbg_axs[2].set_xlabel("step")
+            dbg_axs[2].legend(loc="best")
+            dbg_axs[2].grid(True, alpha=0.3)
+            plt.tight_layout()
+            dbg_path = out_dir / f"{args.split}_ep_{e:05d}_velocity_heads_and_gate.png"
+            plt.savefig(dbg_path, dpi=140)
+            plt.close(fig_dbg)
+            row["velocity_heads_plot"] = dbg_path.name
+
         rows.append(row)
         all_pred_state.append(pred_state)
         all_true_state.append(true_state)
         all_evt_logits.append(evt_logit_np)
         all_evt_true.append(evt_true)
+        all_gate.append(gate_np)
         print(
             f"[{idx}/{len(eval_eps)}] ep={e} mean_err={row['mean_err']:.6f} "
             f"max_err={row['max_err']:.6f} final_err={row['final_err']:.6f} "
@@ -368,6 +410,7 @@ def main() -> None:
         labels=evt_all,
         threshold=float(args.event_prob_threshold),
     )
+    sign_metrics = compute_sign_accuracy(pred_all[:, 2:], true_all[:, 2:], sign_epsilon=float(args.sign_epsilon))
 
     div_steps = np.array([r["divergence_step"] for r in rows], dtype=np.float64)
     summary = {
@@ -382,6 +425,7 @@ def main() -> None:
         "position_mse": pos_mse,
         "velocity_mse": vel_mse,
         **evt_metrics,
+        **sign_metrics,
         "rows": rows,
         "best_epoch": int(ckpt.get("best_epoch", -1)),
         "best_val_state_mse": float(ckpt.get("best_val_state_mse", float("nan"))),
@@ -395,6 +439,7 @@ def main() -> None:
     print(
         f"Aggregate | state_mse={summary['state_mse']:.6f} pos_mse={summary['position_mse']:.6f} "
         f"vel_mse={summary['velocity_mse']:.6f} evt_acc={summary['event_accuracy']:.4f} "
+        f"sign_vx={summary['sign_acc_vx']:.4f} sign_vy={summary['sign_acc_vy']:.4f} "
         f"| ttf_median={summary['ttf_median']:.2f} ttf_p10={summary['ttf_p10']:.2f} "
         f"divergence_rate={summary['divergence_rate']:.3f}"
     )

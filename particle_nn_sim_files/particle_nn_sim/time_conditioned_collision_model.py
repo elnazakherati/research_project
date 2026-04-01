@@ -68,6 +68,7 @@ class TimeConditionedCollisionModelConfig:
     trunk_depth: int = 3
     activation: str = "gelu"  # {"gelu", "silu"}
     dropout: float = 0.0
+    alpha_gate: float = 5.0
     time_encoding: TimeEncodingConfig = field(default_factory=TimeEncodingConfig)
 
 
@@ -82,11 +83,14 @@ def _make_activation(name: str) -> nn.Module:
 
 class TimeConditionedCollisionModel(nn.Module):
     """
-    Pure-ML time-conditioned model:
-        f_theta(s0, gamma(t)) -> [x(t), y(t), vx(t), vy(t), z_event(t)]
-    with a shared trunk and two heads:
-      - state head: 4 outputs (absolute state at queried time)
-      - event head: 1 output (collision-nearness logit)
+    Pure-ML time-conditioned model with event-gated velocity:
+        f_theta(s0, gamma(t)) -> [x(t), y(t), v_pre, v_post, z_event]
+
+    Final velocity is a learned convex combination:
+        gate = sigmoid(alpha_gate * z_event)
+        v_pred = (1-gate)*v_pre + gate*v_post
+
+    No wall-reflection physics is hard-coded; gating is fully learned.
     """
 
     def __init__(self, cfg: TimeConditionedCollisionModelConfig):
@@ -108,7 +112,9 @@ class TimeConditionedCollisionModel(nn.Module):
                 trunk_layers.append(nn.Dropout(drop))
         self.trunk = nn.Sequential(*trunk_layers)
 
-        self.state_head = nn.Linear(width, 4)
+        self.pos_head = nn.Linear(width, 2)
+        self.vel_pre_head = nn.Linear(width, 2)
+        self.vel_post_head = nn.Linear(width, 2)
         self.event_head = nn.Linear(width, 1)
 
         self._init_weights()
@@ -119,20 +125,36 @@ class TimeConditionedCollisionModel(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, s0: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, s0: torch.Tensor, t: torch.Tensor) -> dict[str, torch.Tensor]:
         """
         Args:
             s0: (B,4), initial state
             t:  (B,) or (B,1), queried time in seconds
-        Returns:
-            state_pred: (B,4), [x(t),y(t),vx(t),vy(t)]
-            event_logit: (B,1), near-collision logit at queried t
+        Returns dict with:
+            pos: (B,2)
+            v_pre: (B,2)
+            v_post: (B,2)
+            event_logit: (B,1)
+            gate: (B,1)
+            state: (B,4) => [x(t), y(t), vx(t), vy(t)]
         """
         if s0.ndim != 2 or s0.shape[1] != 4:
             raise ValueError(f"s0 must be shape (B,4), got {tuple(s0.shape)}")
         gamma_t = self.time_encoder(t)
         x = torch.cat([s0, gamma_t], dim=1)
         h = self.trunk(x)
-        state_pred = self.state_head(h)
+        pos = self.pos_head(h)
+        v_pre = self.vel_pre_head(h)
+        v_post = self.vel_post_head(h)
         event_logit = self.event_head(h)
-        return state_pred, event_logit
+        gate = torch.sigmoid(float(self.cfg.alpha_gate) * event_logit)
+        v_pred = (1.0 - gate) * v_pre + gate * v_post
+        state_pred = torch.cat([pos, v_pred], dim=1)
+        return {
+            "pos": pos,
+            "v_pre": v_pre,
+            "v_post": v_post,
+            "event_logit": event_logit,
+            "gate": gate,
+            "state": state_pred,
+        }
