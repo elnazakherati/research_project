@@ -17,6 +17,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
 from particle_nn_sim.one_particle_data import collect_episodes_1p
+from particle_nn_sim.one_particle_rollout import animate_overlay_gt_perturbed_1p, save_animation_mp4
 from particle_nn_sim.simulator import ParticleSim2D
 from particle_nn_sim.time_conditioned_collision_model import (
     TimeConditionedCollisionModel,
