@@ -419,6 +419,11 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--event-prob-threshold", type=float, default=0.5)
     p.add_argument("--plot-episode-idx", type=int, default=0)
     p.add_argument("--out-dir", type=str, default="checkpoints/tc_collision_1p")
+    p.add_argument("--use-wandb", type=str2bool, default=False)
+    p.add_argument("--wandb-project", type=str, default="particle-nn-sim")
+    p.add_argument("--wandb-entity", type=str, default="")
+    p.add_argument("--wandb-run-name", type=str, default="")
+    p.add_argument("--wandb-tags", type=str, default="")
     return p
 
 
@@ -511,6 +516,41 @@ def main() -> None:
             },
         }
     )
+
+    wandb_run = None
+    if args.use_wandb:
+        try:
+            import wandb  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                "--use-wandb was set but wandb is not available. "
+                "Install with `pip install wandb` in your environment."
+            ) from e
+        tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
+        init_kwargs: dict[str, Any] = {
+            "project": args.wandb_project,
+            "config": {
+                "data": asdict(data_cfg),
+                "train": asdict(train_cfg),
+                "loss_weights": asdict(lw),
+                "run": asdict(run_cfg),
+                "model": {
+                    "state_dim": model_cfg.state_dim,
+                    "trunk_width": model_cfg.trunk_width,
+                    "trunk_depth": model_cfg.trunk_depth,
+                    "activation": model_cfg.activation,
+                    "dropout": model_cfg.dropout,
+                    "num_frequencies": model_cfg.time_encoding.num_frequencies,
+                },
+            },
+            "tags": tags,
+            "dir": str(out_dir),
+        }
+        if args.wandb_entity:
+            init_kwargs["entity"] = args.wandb_entity
+        if args.wandb_run_name:
+            init_kwargs["name"] = args.wandb_run_name
+        wandb_run = wandb.init(**init_kwargs)
 
     # Data generation.
     radius_eff = data_cfg.radius if data_cfg.radius > 0.0 else 1e-6
@@ -701,6 +741,31 @@ def main() -> None:
             best["epoch"] = ep
             best["state_dict"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "epoch": ep,
+                    "train_total_loss": train_total,
+                    "train_pos_mse_loss": train_pos,
+                    "train_vel_mse_loss": train_vel,
+                    "train_event_bce_loss": train_evt,
+                    "val_state_mse": val_metrics["state_mse"],
+                    "val_position_mse": val_metrics["position_mse"],
+                    "val_velocity_mse": val_metrics["velocity_mse"],
+                    "val_event_accuracy": val_metrics["event_accuracy"],
+                    "val_event_precision": val_metrics["event_precision"],
+                    "val_event_recall": val_metrics["event_recall"],
+                    "test_state_mse": test_metrics["state_mse"],
+                    "test_position_mse": test_metrics["position_mse"],
+                    "test_velocity_mse": test_metrics["velocity_mse"],
+                    "test_event_accuracy": test_metrics["event_accuracy"],
+                    "test_event_precision": test_metrics["event_precision"],
+                    "test_event_recall": test_metrics["event_recall"],
+                    "best_val_state_mse_so_far": best["val_state_mse"],
+                    "best_epoch_so_far": best["epoch"],
+                }
+            )
+
         print(
             f"Epoch {ep:04d} | train_total={train_total:.6f} pos={train_pos:.6f} vel={train_vel:.6f} evt={train_evt:.6f} "
             f"| val_state={val_metrics['state_mse']:.6f} val_evt_acc={val_metrics['event_accuracy']:.4f} "
@@ -823,6 +888,19 @@ def main() -> None:
         },
     }
     torch.save(ckpt, out_dir / "model_tc_collision_1p.pt")
+
+    if wandb_run is not None:
+        wandb_run.summary["best_epoch"] = int(best["epoch"])
+        wandb_run.summary["best_val_state_mse"] = float(best["val_state_mse"])
+        wandb_run.summary["final_train_state_mse"] = final_train["state_mse"]
+        wandb_run.summary["final_val_state_mse"] = final_val["state_mse"]
+        wandb_run.summary["final_test_state_mse"] = final_test["state_mse"]
+        wandb_run.summary["final_test_position_mse"] = final_test["position_mse"]
+        wandb_run.summary["final_test_velocity_mse"] = final_test["velocity_mse"]
+        wandb_run.summary["final_test_event_accuracy"] = final_test["event_accuracy"]
+        wandb_run.summary["final_test_event_precision"] = final_test["event_precision"]
+        wandb_run.summary["final_test_event_recall"] = final_test["event_recall"]
+        wandb_run.finish()
 
     print("Run complete.")
     print("Artifacts:")
