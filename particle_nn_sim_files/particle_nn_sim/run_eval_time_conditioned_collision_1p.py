@@ -61,13 +61,38 @@ def extract_collision_steps(coll_ep: np.ndarray | None, vel_ep: np.ndarray) -> n
     return infer_collision_steps_from_velocity(vel_ep)
 
 
-def build_near_collision_labels(T: int, collision_steps: np.ndarray, eps_steps: int) -> np.ndarray:
+def build_event_targets(
+    T: int,
+    collision_steps: np.ndarray,
+    dt: float,
+    mode: str,
+    eps_steps: int,
+    event_window: float,
+    sigma_event: float,
+) -> np.ndarray:
     labels = np.zeros((T,), dtype=np.float32)
-    for c in collision_steps:
-        lo = int(max(0, int(c) - eps_steps))
-        hi = int(min(T - 1, int(c) + eps_steps))
-        labels[lo : hi + 1] = 1.0
-    return labels
+    if len(collision_steps) == 0:
+        return labels
+
+    mode = str(mode).strip().lower()
+    if mode == "window":
+        win_steps = max(int(eps_steps), int(np.ceil(float(event_window) / float(dt))))
+        for c in collision_steps:
+            lo = int(max(0, int(c) - win_steps))
+            hi = int(min(T - 1, int(c) + win_steps))
+            labels[lo : hi + 1] = 1.0
+        return labels
+
+    if mode == "gaussian":
+        sigma_steps = max(float(sigma_event) / float(dt), 1e-6)
+        idx = np.arange(T, dtype=np.float32)
+        for c in collision_steps:
+            d = idx - float(c)
+            g = np.exp(-0.5 * (d / sigma_steps) ** 2).astype(np.float32)
+            labels = np.maximum(labels, g)
+        return np.clip(labels, 0.0, 1.0).astype(np.float32)
+
+    raise ValueError(f"Unsupported event_target_mode: {mode}")
 
 
 def compute_event_metrics(logits: np.ndarray, labels: np.ndarray, threshold: float = 0.5) -> dict[str, float]:
@@ -148,25 +173,33 @@ def main() -> None:
             f"Expected model_name='TimeConditionedCollisionModel', got {ckpt.get('model_name')!r}"
         )
 
+    cfg = ckpt["config"]
+    data_cfg = cfg["data"]
+    train_cfg = cfg["train"]
+    split_indices = ckpt["split_indices"]
     model_cfg_raw = ckpt["model_config"]
+    default_time_max = float(data_cfg.get("dt", 0.01)) * float(data_cfg.get("steps", 700))
     model_cfg = TimeConditionedCollisionModelConfig(
         state_dim=int(model_cfg_raw["state_dim"]),
         trunk_width=int(model_cfg_raw["trunk_width"]),
         trunk_depth=int(model_cfg_raw["trunk_depth"]),
         activation=str(model_cfg_raw["activation"]),
         dropout=float(model_cfg_raw["dropout"]),
+        model_variant=str(model_cfg_raw.get("model_variant", "gated_tcno")),
         alpha_gate=float(model_cfg_raw.get("alpha_gate", 5.0)),
-        time_encoding=TimeEncodingConfig(num_frequencies=int(model_cfg_raw["num_frequencies"])),
+        time_encoding=TimeEncodingConfig(
+            mode=str(model_cfg_raw.get("time_encoding_mode", "fourier")),
+            num_frequencies=int(model_cfg_raw.get("num_frequencies", 8)),
+            include_raw_time=bool(model_cfg_raw.get("include_raw_time", True)),
+            base_frequency=float(model_cfg_raw.get("base_frequency", 1.0)),
+            normalize_time=bool(model_cfg_raw.get("normalize_time", True)),
+            max_time=float(model_cfg_raw.get("time_max", default_time_max)),
+        ),
     )
     model = TimeConditionedCollisionModel(model_cfg)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
     model.eval()
-
-    cfg = ckpt["config"]
-    data_cfg = cfg["data"]
-    train_cfg = cfg["train"]
-    split_indices = ckpt["split_indices"]
 
     # Regenerate episodes to recover full trajectories for split eval.
     radius_eff = float(data_cfg.get("radius", 0.0))
@@ -249,6 +282,9 @@ def main() -> None:
     all_gate: list[np.ndarray] = []
 
     eps_steps = int(data_cfg.get("coll_epsilon_steps", 2))
+    event_target_mode = str(data_cfg.get("event_target_mode", "window"))
+    event_window = float(data_cfg.get("event_window", 0.05))
+    sigma_event = float(data_cfg.get("sigma_event", 0.03))
 
     for idx, e in enumerate(eval_eps, start=1):
         e = int(e)
@@ -290,7 +326,15 @@ def main() -> None:
 
         true_state = np.concatenate([pos_true[:, 0, :], vel_true[:, 0, :]], axis=1).astype(np.float32)
         coll_steps = extract_collision_steps(coll_all[e], vel_true)
-        evt_true = build_near_collision_labels(T=T, collision_steps=coll_steps, eps_steps=eps_steps)
+        evt_true = build_event_targets(
+            T=T,
+            collision_steps=coll_steps,
+            dt=dt,
+            mode=event_target_mode,
+            eps_steps=eps_steps,
+            event_window=event_window,
+            sigma_event=sigma_event,
+        )
 
         pred_pos = pred_state[:, :2].reshape(T, 1, 2).astype(np.float32)
         true_pos = true_state[:, :2].reshape(T, 1, 2).astype(np.float32)

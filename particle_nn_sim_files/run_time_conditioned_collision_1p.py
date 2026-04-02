@@ -57,9 +57,12 @@ class DataConfig:
     mass: float = 1.0
     wall_collision_mode: str = "clamp"
     coll_epsilon_steps: int = 2
+    event_target_mode: str = "gaussian"  # {"window","gaussian"}
+    event_window: float = 0.05
+    sigma_event: float = 0.03
     use_collision_oversampling: bool = True
     collision_sample_fraction: float = 0.6
-    collision_window: float = 0.03
+    collision_window: float = 0.05
     # Optional IC controls to match existing workflows.
     fixed_x: float | None = None
     fixed_y: float | None = None
@@ -201,17 +204,38 @@ def extract_collision_steps(coll_ep: np.ndarray | None, vel_ep: np.ndarray) -> n
     return infer_collision_steps_from_velocity(vel_ep)
 
 
-def build_near_collision_labels(T: int, collision_steps: np.ndarray, eps_steps: int) -> np.ndarray:
+def build_event_targets(
+    T: int,
+    collision_steps: np.ndarray,
+    dt: float,
+    mode: str,
+    eps_steps: int,
+    event_window: float,
+    sigma_event: float,
+) -> np.ndarray:
     labels = np.zeros((T,), dtype=np.float32)
     if len(collision_steps) == 0:
         return labels
-    idx = np.arange(T, dtype=np.int64)
-    for c in collision_steps:
-        lo = int(max(0, int(c) - eps_steps))
-        hi = int(min(T - 1, int(c) + eps_steps))
-        labels[lo : hi + 1] = 1.0
-    # Ensure t=0 is usually non-event unless explicitly near collision.
-    return labels
+
+    mode = str(mode).strip().lower()
+    if mode == "window":
+        win_steps = max(int(eps_steps), int(np.ceil(float(event_window) / float(dt))))
+        for c in collision_steps:
+            lo = int(max(0, int(c) - win_steps))
+            hi = int(min(T - 1, int(c) + win_steps))
+            labels[lo : hi + 1] = 1.0
+        return labels
+
+    if mode == "gaussian":
+        sigma_steps = max(float(sigma_event) / float(dt), 1e-6)
+        idx = np.arange(T, dtype=np.float32)
+        for c in collision_steps:
+            d = idx - float(c)
+            g = np.exp(-0.5 * (d / sigma_steps) ** 2).astype(np.float32)
+            labels = np.maximum(labels, g)
+        return np.clip(labels, 0.0, 1.0).astype(np.float32)
+
+    raise ValueError(f"Unsupported event_target_mode: {mode}")
 
 
 def build_query_samples(
@@ -221,9 +245,12 @@ def build_query_samples(
     dt: float,
     episode_indices: np.ndarray,
     eps_steps: int,
+    event_target_mode: str = "gaussian",
+    event_window: float = 0.05,
+    sigma_event: float = 0.03,
     use_collision_oversampling: bool = True,
     collision_sample_fraction: float = 0.6,
-    collision_window: float = 0.03,
+    collision_window: float = 0.05,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Builds samples:
@@ -241,7 +268,15 @@ def build_query_samples(
         T = pos_ep.shape[0]
         coll_ep = None if coll_all is None else coll_all[e]
         collision_steps = extract_collision_steps(coll_ep, vel_ep)
-        near_event = build_near_collision_labels(T=T, collision_steps=collision_steps, eps_steps=int(eps_steps))
+        event_target = build_event_targets(
+            T=T,
+            collision_steps=collision_steps,
+            dt=float(dt),
+            mode=event_target_mode,
+            eps_steps=int(eps_steps),
+            event_window=float(event_window),
+            sigma_event=float(sigma_event),
+        )
 
         s0 = np.concatenate([pos_ep[0, 0], vel_ep[0, 0]], axis=0).astype(np.float32)  # (4,)
         states = np.concatenate([pos_ep[:, 0, :], vel_ep[:, 0, :]], axis=1).astype(np.float32)  # (T,4)
@@ -273,7 +308,7 @@ def build_query_samples(
         s0_list.append(s0_rep)
         t_list.append(t_query[idx_use])
         state_list.append(states[idx_use])
-        event_list.append(near_event[idx_use])
+        event_list.append(event_target[idx_use])
 
     return (
         np.concatenate(s0_list, axis=0).astype(np.float32),
@@ -427,9 +462,12 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--mass", type=float, default=1.0)
     p.add_argument("--wall-collision-mode", type=str, default="clamp", choices=["clamp", "exact"])
     p.add_argument("--coll-epsilon-steps", type=int, default=2)
+    p.add_argument("--event-target-mode", type=str, default="gaussian", choices=["window", "gaussian"])
+    p.add_argument("--event-window", type=float, default=0.05)
+    p.add_argument("--sigma-event", type=float, default=0.03)
     p.add_argument("--use-collision-oversampling", type=str2bool, default=True)
     p.add_argument("--collision-sample-fraction", type=float, default=0.6)
-    p.add_argument("--collision-window", type=float, default=0.03)
+    p.add_argument("--collision-window", type=float, default=0.05)
 
     p.add_argument("--fixed-x", type=float, default=None)
     p.add_argument("--fixed-y", type=float, default=None)
@@ -451,6 +489,12 @@ def make_parser() -> argparse.ArgumentParser:
 
     # Model.
     p.add_argument("--num-frequencies", type=int, default=8)
+    p.add_argument("--time-encoding-mode", type=str, default="raw", choices=["raw", "low_freq_fourier", "fourier"])
+    p.add_argument("--base-frequency", type=float, default=1.0)
+    p.add_argument("--include-raw-time", type=str2bool, default=True)
+    p.add_argument("--normalize-time", type=str2bool, default=True)
+    p.add_argument("--time-max", type=float, default=-1.0)
+    p.add_argument("--model-variant", type=str, default="simple_tcno", choices=["simple_tcno", "gated_tcno"])
     p.add_argument("--trunk-width", type=int, default=256)
     p.add_argument("--trunk-depth", type=int, default=3)
     p.add_argument("--activation", type=str, default="gelu", choices=["gelu", "silu"])
@@ -490,6 +534,10 @@ def main() -> None:
     args = make_parser().parse_args()
     if args.coll_epsilon_steps < 0:
         raise ValueError("--coll-epsilon-steps must be >= 0")
+    if args.event_window < 0.0:
+        raise ValueError("--event-window must be >= 0")
+    if args.sigma_event <= 0.0:
+        raise ValueError("--sigma-event must be > 0")
     if not (0.0 <= args.collision_sample_fraction <= 1.0):
         raise ValueError("--collision-sample-fraction must be in [0,1]")
     if args.collision_window < 0.0:
@@ -518,6 +566,9 @@ def main() -> None:
         mass=args.mass,
         wall_collision_mode=args.wall_collision_mode,
         coll_epsilon_steps=args.coll_epsilon_steps,
+        event_target_mode=args.event_target_mode,
+        event_window=args.event_window,
+        sigma_event=args.sigma_event,
         use_collision_oversampling=args.use_collision_oversampling,
         collision_sample_fraction=args.collision_sample_fraction,
         collision_window=args.collision_window,
@@ -561,14 +612,23 @@ def main() -> None:
         event_prob_threshold=args.event_prob_threshold,
         sign_epsilon=args.sign_epsilon,
     )
+    time_max = float(args.time_max) if args.time_max > 0.0 else float(data_cfg.dt) * float(data_cfg.steps)
     model_cfg = TimeConditionedCollisionModelConfig(
         state_dim=4,
         trunk_width=args.trunk_width,
         trunk_depth=args.trunk_depth,
         activation=args.activation,
         dropout=args.dropout,
+        model_variant=args.model_variant,
         alpha_gate=args.alpha_gate,
-        time_encoding=TimeEncodingConfig(num_frequencies=args.num_frequencies),
+        time_encoding=TimeEncodingConfig(
+            mode=args.time_encoding_mode,
+            num_frequencies=args.num_frequencies,
+            include_raw_time=args.include_raw_time,
+            base_frequency=args.base_frequency,
+            normalize_time=args.normalize_time,
+            max_time=time_max,
+        ),
     )
     print("Config:")
     print(
@@ -581,7 +641,13 @@ def main() -> None:
                 "trunk_depth": model_cfg.trunk_depth,
                 "activation": model_cfg.activation,
                 "dropout": model_cfg.dropout,
+                "model_variant": model_cfg.model_variant,
                 "alpha_gate": model_cfg.alpha_gate,
+                "time_encoding_mode": model_cfg.time_encoding.mode,
+                "base_frequency": model_cfg.time_encoding.base_frequency,
+                "include_raw_time": model_cfg.time_encoding.include_raw_time,
+                "normalize_time": model_cfg.time_encoding.normalize_time,
+                "time_max": model_cfg.time_encoding.max_time,
                 "num_frequencies": model_cfg.time_encoding.num_frequencies,
             },
         }
@@ -610,6 +676,13 @@ def main() -> None:
                     "trunk_depth": model_cfg.trunk_depth,
                     "activation": model_cfg.activation,
                     "dropout": model_cfg.dropout,
+                    "model_variant": model_cfg.model_variant,
+                    "alpha_gate": model_cfg.alpha_gate,
+                    "time_encoding_mode": model_cfg.time_encoding.mode,
+                    "base_frequency": model_cfg.time_encoding.base_frequency,
+                    "include_raw_time": model_cfg.time_encoding.include_raw_time,
+                    "normalize_time": model_cfg.time_encoding.normalize_time,
+                    "time_max": model_cfg.time_encoding.max_time,
                     "num_frequencies": model_cfg.time_encoding.num_frequencies,
                 },
             },
@@ -683,6 +756,9 @@ def main() -> None:
         dt=meta["dt"],
         episode_indices=train_eps,
         eps_steps=data_cfg.coll_epsilon_steps,
+        event_target_mode=data_cfg.event_target_mode,
+        event_window=data_cfg.event_window,
+        sigma_event=data_cfg.sigma_event,
         use_collision_oversampling=data_cfg.use_collision_oversampling,
         collision_sample_fraction=data_cfg.collision_sample_fraction,
         collision_window=data_cfg.collision_window,
@@ -694,6 +770,9 @@ def main() -> None:
         dt=meta["dt"],
         episode_indices=val_eps,
         eps_steps=data_cfg.coll_epsilon_steps,
+        event_target_mode=data_cfg.event_target_mode,
+        event_window=data_cfg.event_window,
+        sigma_event=data_cfg.sigma_event,
         use_collision_oversampling=False,
         collision_sample_fraction=data_cfg.collision_sample_fraction,
         collision_window=data_cfg.collision_window,
@@ -705,6 +784,9 @@ def main() -> None:
         dt=meta["dt"],
         episode_indices=test_eps,
         eps_steps=data_cfg.coll_epsilon_steps,
+        event_target_mode=data_cfg.event_target_mode,
+        event_window=data_cfg.event_window,
+        sigma_event=data_cfg.sigma_event,
         use_collision_oversampling=False,
         collision_sample_fraction=data_cfg.collision_sample_fraction,
         collision_window=data_cfg.collision_window,
@@ -885,7 +967,15 @@ def main() -> None:
     true_state = np.concatenate([pos_ep[:, 0, :], vel_ep[:, 0, :]], axis=1).astype(np.float32)
 
     coll_steps = extract_collision_steps(coll_all[ep], vel_ep)
-    evt_true = build_near_collision_labels(T=T, collision_steps=coll_steps, eps_steps=data_cfg.coll_epsilon_steps)
+    evt_true = build_event_targets(
+        T=T,
+        collision_steps=coll_steps,
+        dt=float(meta["dt"]),
+        mode=data_cfg.event_target_mode,
+        eps_steps=data_cfg.coll_epsilon_steps,
+        event_window=data_cfg.event_window,
+        sigma_event=data_cfg.sigma_event,
+    )
 
     s0_batch = np.repeat(s0[None, :], T, axis=0).astype(np.float32)
     if s0_std is not None:
@@ -949,7 +1039,13 @@ def main() -> None:
                 "trunk_depth": model_cfg.trunk_depth,
                 "activation": model_cfg.activation,
                 "dropout": model_cfg.dropout,
+                "model_variant": model_cfg.model_variant,
                 "alpha_gate": model_cfg.alpha_gate,
+                "time_encoding_mode": model_cfg.time_encoding.mode,
+                "base_frequency": model_cfg.time_encoding.base_frequency,
+                "include_raw_time": model_cfg.time_encoding.include_raw_time,
+                "normalize_time": model_cfg.time_encoding.normalize_time,
+                "time_max": model_cfg.time_encoding.max_time,
                 "num_frequencies": model_cfg.time_encoding.num_frequencies,
             },
         },
@@ -965,7 +1061,13 @@ def main() -> None:
             "trunk_depth": model_cfg.trunk_depth,
             "activation": model_cfg.activation,
             "dropout": model_cfg.dropout,
+            "model_variant": model_cfg.model_variant,
             "alpha_gate": model_cfg.alpha_gate,
+            "time_encoding_mode": model_cfg.time_encoding.mode,
+            "base_frequency": model_cfg.time_encoding.base_frequency,
+            "include_raw_time": model_cfg.time_encoding.include_raw_time,
+            "normalize_time": model_cfg.time_encoding.normalize_time,
+            "time_max": model_cfg.time_encoding.max_time,
             "num_frequencies": model_cfg.time_encoding.num_frequencies,
         },
         "model_state_dict": model.state_dict(),

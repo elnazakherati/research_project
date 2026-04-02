@@ -9,32 +9,49 @@ import torch.nn as nn
 
 @dataclass
 class TimeEncodingConfig:
-    """Configuration for Fourier time encoding."""
+    """Configuration for time encoding."""
 
+    mode: str = "raw"  # {"raw", "low_freq_fourier", "fourier"}
     num_frequencies: int = 8
     include_raw_time: bool = True
     base_frequency: float = 1.0
+    normalize_time: bool = True
+    max_time: float = 1.0
 
 
-class FourierTimeEncoder(nn.Module):
+class TimeEncoder(nn.Module):
     """
-    Fourier-feature time encoder:
-        gamma(t) = [t, sin(2*pi*f_k*t), cos(2*pi*f_k*t)]_k
-    with dyadic frequencies f_k = base_frequency * 2^k.
+    Time encoder with three modes:
+      raw: [t]
+      low_freq_fourier: [t, sin/cos(2*pi*f_k*t)] with low linear frequencies
+      fourier: [t, sin/cos(2*pi*f_k*t)] with dyadic frequencies
+
+    All modes are pure learned feature preprocessing; no physics is hard-coded.
     """
 
     def __init__(self, cfg: TimeEncodingConfig):
         super().__init__()
-        if cfg.num_frequencies < 1:
-            raise ValueError("num_frequencies must be >= 1")
+        if cfg.max_time <= 0.0:
+            raise ValueError("max_time must be > 0")
+        if cfg.mode not in {"raw", "low_freq_fourier", "fourier"}:
+            raise ValueError(f"Unsupported time encoding mode: {cfg.mode}")
+        if cfg.mode != "raw" and cfg.num_frequencies < 1:
+            raise ValueError("num_frequencies must be >= 1 for Fourier modes")
         self.cfg = cfg
-        freqs = [cfg.base_frequency * (2.0**k) for k in range(cfg.num_frequencies)]
+        if cfg.mode == "fourier":
+            freqs = [cfg.base_frequency * (2.0**k) for k in range(cfg.num_frequencies)]
+        elif cfg.mode == "low_freq_fourier":
+            freqs = [cfg.base_frequency * float(k + 1) for k in range(cfg.num_frequencies)]
+        else:
+            freqs = []
         self.register_buffer("freqs", torch.tensor(freqs, dtype=torch.float32), persistent=False)
 
     @property
     def out_dim(self) -> int:
+        if self.cfg.mode == "raw":
+            return 1
         base = 1 if self.cfg.include_raw_time else 0
-        return base + 2 * self.cfg.num_frequencies
+        return base + 2 * int(self.cfg.num_frequencies)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         """
@@ -48,13 +65,16 @@ class FourierTimeEncoder(nn.Module):
         if t.ndim != 2 or t.shape[1] != 1:
             raise ValueError(f"t must be shape (B,) or (B,1), got {tuple(t.shape)}")
 
-        # (B, K)
-        wt = 2.0 * math.pi * t * self.freqs.unsqueeze(0)
+        t_enc = t / float(self.cfg.max_time) if self.cfg.normalize_time else t
+        if self.cfg.mode == "raw":
+            return t_enc
+
+        wt = 2.0 * math.pi * t_enc * self.freqs.unsqueeze(0)
         sin_part = torch.sin(wt)
         cos_part = torch.cos(wt)
         parts = []
         if self.cfg.include_raw_time:
-            parts.append(t)
+            parts.append(t_enc)
         parts.extend([sin_part, cos_part])
         return torch.cat(parts, dim=1)
 
@@ -68,6 +88,7 @@ class TimeConditionedCollisionModelConfig:
     trunk_depth: int = 3
     activation: str = "gelu"  # {"gelu", "silu"}
     dropout: float = 0.0
+    model_variant: str = "simple_tcno"  # {"simple_tcno", "gated_tcno"}
     alpha_gate: float = 5.0
     time_encoding: TimeEncodingConfig = field(default_factory=TimeEncodingConfig)
 
@@ -83,20 +104,17 @@ def _make_activation(name: str) -> nn.Module:
 
 class TimeConditionedCollisionModel(nn.Module):
     """
-    Pure-ML time-conditioned model with event-gated velocity:
-        f_theta(s0, gamma(t)) -> [x(t), y(t), v_pre, v_post, z_event]
-
-    Final velocity is a learned convex combination:
-        gate = sigmoid(alpha_gate * z_event)
-        v_pred = (1-gate)*v_pre + gate*v_post
-
-    No wall-reflection physics is hard-coded; gating is fully learned.
+    Pure-ML time-conditioned model supporting two variants:
+      simple_tcno: position + velocity + event heads (no gating)
+      gated_tcno:  position + pre/post velocity + event heads with learned gate
     """
 
     def __init__(self, cfg: TimeConditionedCollisionModelConfig):
         super().__init__()
         self.cfg = cfg
-        self.time_encoder = FourierTimeEncoder(cfg.time_encoding)
+        if cfg.model_variant not in {"simple_tcno", "gated_tcno"}:
+            raise ValueError(f"Unsupported model_variant: {cfg.model_variant}")
+        self.time_encoder = TimeEncoder(cfg.time_encoding)
 
         in_dim = cfg.state_dim + self.time_encoder.out_dim
         width = cfg.trunk_width
@@ -113,8 +131,14 @@ class TimeConditionedCollisionModel(nn.Module):
         self.trunk = nn.Sequential(*trunk_layers)
 
         self.pos_head = nn.Linear(width, 2)
-        self.vel_pre_head = nn.Linear(width, 2)
-        self.vel_post_head = nn.Linear(width, 2)
+        if cfg.model_variant == "gated_tcno":
+            self.vel_pre_head = nn.Linear(width, 2)
+            self.vel_post_head = nn.Linear(width, 2)
+            self.vel_head = None
+        else:
+            self.vel_head = nn.Linear(width, 2)
+            self.vel_pre_head = None
+            self.vel_post_head = None
         self.event_head = nn.Linear(width, 1)
 
         self._init_weights()
@@ -132,10 +156,11 @@ class TimeConditionedCollisionModel(nn.Module):
             t:  (B,) or (B,1), queried time in seconds
         Returns dict with:
             pos: (B,2)
+            vel: (B,2) for simple_tcno
             v_pre: (B,2)
             v_post: (B,2)
             event_logit: (B,1)
-            gate: (B,1)
+            gate: (B,1), zeros for simple_tcno
             state: (B,4) => [x(t), y(t), vx(t), vy(t)]
         """
         if s0.ndim != 2 or s0.shape[1] != 4:
@@ -144,14 +169,27 @@ class TimeConditionedCollisionModel(nn.Module):
         x = torch.cat([s0, gamma_t], dim=1)
         h = self.trunk(x)
         pos = self.pos_head(h)
-        v_pre = self.vel_pre_head(h)
-        v_post = self.vel_post_head(h)
         event_logit = self.event_head(h)
-        gate = torch.sigmoid(float(self.cfg.alpha_gate) * event_logit)
-        v_pred = (1.0 - gate) * v_pre + gate * v_post
+
+        if self.cfg.model_variant == "gated_tcno":
+            assert self.vel_pre_head is not None and self.vel_post_head is not None
+            v_pre = self.vel_pre_head(h)
+            v_post = self.vel_post_head(h)
+            gate = torch.sigmoid(float(self.cfg.alpha_gate) * event_logit)
+            v_pred = (1.0 - gate) * v_pre + gate * v_post
+            vel = v_pred
+        else:
+            assert self.vel_head is not None
+            vel = self.vel_head(h)
+            v_pre = vel
+            v_post = vel
+            gate = torch.zeros_like(event_logit)
+            v_pred = vel
+
         state_pred = torch.cat([pos, v_pred], dim=1)
         return {
             "pos": pos,
+            "vel": vel,
             "v_pre": v_pre,
             "v_post": v_post,
             "event_logit": event_logit,
