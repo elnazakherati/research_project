@@ -323,6 +323,12 @@ def main() -> None:
             gate_np = out["gate"].squeeze(1).cpu().numpy().astype(np.float32)
             v_pre_np = out["v_pre"].cpu().numpy().astype(np.float32)
             v_post_np = out["v_post"].cpu().numpy().astype(np.float32)
+            if y_mean is not None and y_std is not None:
+                # v_pre/v_post are model-space values; map velocity dims back to data-space.
+                vel_mean = y_mean[:, 2:]
+                vel_std = y_std[:, 2:]
+                v_pre_np = (v_pre_np * vel_std + vel_mean).astype(np.float32)
+                v_post_np = (v_post_np * vel_std + vel_mean).astype(np.float32)
 
         true_state = np.concatenate([pos_true[:, 0, :], vel_true[:, 0, :]], axis=1).astype(np.float32)
         coll_steps = extract_collision_steps(coll_all[e], vel_true)
@@ -395,7 +401,8 @@ def main() -> None:
             evt_prob = 1.0 / (1.0 + np.exp(-np.clip(evt_logit_np, -60.0, 60.0)))
             axs[1].plot(np.arange(T), evt_prob, lw=2, label="pred p(event)")
             axs[1].plot(np.arange(T), evt_true, lw=1.5, alpha=0.75, label="target event")
-            axs[1].plot(np.arange(T), gate_np, lw=1.7, alpha=0.9, label="gate")
+            if model_cfg.model_variant == "gated_tcno":
+                axs[1].plot(np.arange(T), gate_np, lw=1.7, alpha=0.9, label="gate")
             axs[1].set_ylabel("event")
             axs[1].set_xlabel("step")
             axs[1].set_ylim([-0.05, 1.05])
@@ -407,27 +414,28 @@ def main() -> None:
             plt.close(fig)
             row["error_event_plot"] = plot_path.name
 
-            fig_dbg, dbg_axs = plt.subplots(3, 1, figsize=(8, 7), sharex=True)
-            dbg_axs[0].plot(np.arange(T), v_pre_np[:, 0], label="v_pre_x", alpha=0.9)
-            dbg_axs[0].plot(np.arange(T), v_post_np[:, 0], label="v_post_x", alpha=0.9)
-            dbg_axs[0].plot(np.arange(T), true_state[:, 2], label="true_vx", lw=1.8)
-            dbg_axs[0].legend(loc="best")
-            dbg_axs[0].grid(True, alpha=0.3)
-            dbg_axs[1].plot(np.arange(T), v_pre_np[:, 1], label="v_pre_y", alpha=0.9)
-            dbg_axs[1].plot(np.arange(T), v_post_np[:, 1], label="v_post_y", alpha=0.9)
-            dbg_axs[1].plot(np.arange(T), true_state[:, 3], label="true_vy", lw=1.8)
-            dbg_axs[1].legend(loc="best")
-            dbg_axs[1].grid(True, alpha=0.3)
-            dbg_axs[2].plot(np.arange(T), gate_np, label="gate", lw=1.8)
-            dbg_axs[2].plot(np.arange(T), evt_true, label="event target", lw=1.4, alpha=0.8)
-            dbg_axs[2].set_xlabel("step")
-            dbg_axs[2].legend(loc="best")
-            dbg_axs[2].grid(True, alpha=0.3)
-            plt.tight_layout()
-            dbg_path = out_dir / f"{args.split}_ep_{e:05d}_velocity_heads_and_gate.png"
-            plt.savefig(dbg_path, dpi=140)
-            plt.close(fig_dbg)
-            row["velocity_heads_plot"] = dbg_path.name
+            if model_cfg.model_variant == "gated_tcno":
+                fig_dbg, dbg_axs = plt.subplots(3, 1, figsize=(8, 7), sharex=True)
+                dbg_axs[0].plot(np.arange(T), v_pre_np[:, 0], label="v_pre_x", alpha=0.9)
+                dbg_axs[0].plot(np.arange(T), v_post_np[:, 0], label="v_post_x", alpha=0.9)
+                dbg_axs[0].plot(np.arange(T), true_state[:, 2], label="true_vx", lw=1.8)
+                dbg_axs[0].legend(loc="best")
+                dbg_axs[0].grid(True, alpha=0.3)
+                dbg_axs[1].plot(np.arange(T), v_pre_np[:, 1], label="v_pre_y", alpha=0.9)
+                dbg_axs[1].plot(np.arange(T), v_post_np[:, 1], label="v_post_y", alpha=0.9)
+                dbg_axs[1].plot(np.arange(T), true_state[:, 3], label="true_vy", lw=1.8)
+                dbg_axs[1].legend(loc="best")
+                dbg_axs[1].grid(True, alpha=0.3)
+                dbg_axs[2].plot(np.arange(T), gate_np, label="gate", lw=1.8)
+                dbg_axs[2].plot(np.arange(T), evt_true, label="event target", lw=1.4, alpha=0.8)
+                dbg_axs[2].set_xlabel("step")
+                dbg_axs[2].legend(loc="best")
+                dbg_axs[2].grid(True, alpha=0.3)
+                plt.tight_layout()
+                dbg_path = out_dir / f"{args.split}_ep_{e:05d}_velocity_heads_and_gate.png"
+                plt.savefig(dbg_path, dpi=140)
+                plt.close(fig_dbg)
+                row["velocity_heads_plot"] = dbg_path.name
 
         rows.append(row)
         all_pred_state.append(pred_state)
