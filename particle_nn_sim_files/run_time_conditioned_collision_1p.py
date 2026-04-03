@@ -990,7 +990,9 @@ def main() -> None:
         if y_std is not None:
             pred_state = y_std.inverse(pred_state)
         evt_prob = torch.sigmoid(out["event_logit"].squeeze(1)).cpu().numpy().astype(np.float32)
-        gate_np = out["gate"].squeeze(1).cpu().numpy().astype(np.float32)
+        gate_np = None
+        if model_cfg.model_variant == "gated_tcno":
+            gate_np = out["gate"].squeeze(1).cpu().numpy().astype(np.float32)
 
     plot_state_and_event_over_time(
         t_query=t_q,
