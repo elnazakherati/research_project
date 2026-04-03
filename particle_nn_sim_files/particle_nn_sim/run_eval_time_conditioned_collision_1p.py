@@ -414,6 +414,51 @@ def main() -> None:
             plt.close(fig)
             row["error_event_plot"] = plot_path.name
 
+            # Main state/event diagnostic for TCNO: monitor position, velocity, and event quality.
+            fig_state, axs_state = plt.subplots(5, 1, figsize=(10, 10), sharex=True)
+            axs_state[0].plot(np.arange(T), true_state[:, 0], lw=2, label="true")
+            axs_state[0].plot(np.arange(T), pred_state[:, 0], lw=1.8, alpha=0.9, label="pred")
+            axs_state[0].set_ylabel("x(t)")
+            axs_state[0].legend(loc="best")
+            axs_state[0].grid(True, alpha=0.3)
+
+            axs_state[1].plot(np.arange(T), true_state[:, 1], lw=2, label="true")
+            axs_state[1].plot(np.arange(T), pred_state[:, 1], lw=1.8, alpha=0.9, label="pred")
+            axs_state[1].set_ylabel("y(t)")
+            axs_state[1].grid(True, alpha=0.3)
+
+            axs_state[2].plot(np.arange(T), true_state[:, 2], lw=2, label="true")
+            axs_state[2].plot(np.arange(T), pred_state[:, 2], lw=1.8, alpha=0.9, label="pred")
+            axs_state[2].set_ylabel("vx(t)")
+            axs_state[2].grid(True, alpha=0.3)
+
+            axs_state[3].plot(np.arange(T), true_state[:, 3], lw=2, label="true")
+            axs_state[3].plot(np.arange(T), pred_state[:, 3], lw=1.8, alpha=0.9, label="pred")
+            axs_state[3].set_ylabel("vy(t)")
+            axs_state[3].grid(True, alpha=0.3)
+
+            axs_state[4].plot(np.arange(T), evt_prob, lw=2, label="pred p(event)")
+            axs_state[4].plot(np.arange(T), evt_true, lw=1.6, alpha=0.8, label="event target")
+            if model_cfg.model_variant == "gated_tcno":
+                axs_state[4].plot(np.arange(T), gate_np, lw=1.6, alpha=0.8, label="gate")
+            axs_state[4].axhline(float(args.event_prob_threshold), color="k", ls="--", lw=1.0, alpha=0.6)
+            axs_state[4].set_ylabel("event")
+            axs_state[4].set_xlabel("step")
+            axs_state[4].set_ylim([-0.05, 1.05])
+            axs_state[4].grid(True, alpha=0.3)
+            axs_state[4].legend(loc="best")
+
+            fig_state.suptitle(
+                f"TCNO ({args.split}) ep={e}: state and event diagnostics",
+                y=0.995,
+                fontsize=11,
+            )
+            plt.tight_layout()
+            state_plot_path = out_dir / f"{args.split}_ep_{e:05d}_state_and_event.png"
+            plt.savefig(state_plot_path, dpi=140)
+            plt.close(fig_state)
+            row["state_event_plot"] = state_plot_path.name
+
             if model_cfg.model_variant == "gated_tcno":
                 fig_dbg, dbg_axs = plt.subplots(3, 1, figsize=(8, 7), sharex=True)
                 dbg_axs[0].plot(np.arange(T), v_pre_np[:, 0], label="v_pre_x", alpha=0.9)
