@@ -90,6 +90,7 @@ class TimeConditionedCollisionModelConfig:
     dropout: float = 0.0
     model_variant: str = "simple_tcno"  # {"simple_tcno", "gated_tcno"}
     alpha_gate: float = 5.0
+    enforce_t0_anchor: bool = True
     time_encoding: TimeEncodingConfig = field(default_factory=TimeEncodingConfig)
 
 
@@ -141,7 +142,30 @@ class TimeConditionedCollisionModel(nn.Module):
             self.vel_post_head = None
         self.event_head = nn.Linear(width, 1)
 
+        # Optional affine map for converting input-space s0 into output-space anchor.
+        # This is useful when input and output states are normalized with different
+        # standardizers: state_anchor = s0 * scale + bias.
+        self.register_buffer("s0_anchor_scale", torch.ones(1, 4), persistent=False)
+        self.register_buffer("s0_anchor_bias", torch.zeros(1, 4), persistent=False)
+
         self._init_weights()
+
+    def set_s0_anchor_affine(self, scale: torch.Tensor, bias: torch.Tensor) -> None:
+        """
+        Set affine mapping from model input s0-space to model output state-space.
+
+        Args:
+            scale: shape (4,) or (1,4)
+            bias:  shape (4,) or (1,4)
+        """
+        scale = scale.reshape(1, 4).to(dtype=self.s0_anchor_scale.dtype, device=self.s0_anchor_scale.device)
+        bias = bias.reshape(1, 4).to(dtype=self.s0_anchor_bias.dtype, device=self.s0_anchor_bias.device)
+        self.s0_anchor_scale.copy_(scale)
+        self.s0_anchor_bias.copy_(bias)
+
+    def output_anchor_from_s0(self, s0: torch.Tensor) -> torch.Tensor:
+        """Map input-space s0 to output-space anchor state."""
+        return s0 * self.s0_anchor_scale + self.s0_anchor_bias
 
     def _init_weights(self) -> None:
         for m in self.modules():
@@ -165,7 +189,14 @@ class TimeConditionedCollisionModel(nn.Module):
         """
         if s0.ndim != 2 or s0.shape[1] != 4:
             raise ValueError(f"s0 must be shape (B,4), got {tuple(s0.shape)}")
-        gamma_t = self.time_encoder(t)
+        if t.ndim == 1:
+            t_col = t.unsqueeze(1)
+        elif t.ndim == 2 and t.shape[1] == 1:
+            t_col = t
+        else:
+            raise ValueError(f"t must be shape (B,) or (B,1), got {tuple(t.shape)}")
+
+        gamma_t = self.time_encoder(t_col)
         x = torch.cat([s0, gamma_t], dim=1)
         h = self.trunk(x)
         pos = self.pos_head(h)
@@ -186,7 +217,14 @@ class TimeConditionedCollisionModel(nn.Module):
             gate = torch.zeros_like(event_logit)
             v_pred = vel
 
-        state_pred = torch.cat([pos, v_pred], dim=1)
+        state_delta = torch.cat([pos, v_pred], dim=1)
+        if self.cfg.enforce_t0_anchor:
+            # Reparameterization: s_hat(t) = s0_anchor + t * h_theta(s0, t)
+            # This guarantees exact initial-state matching at t=0.
+            s0_anchor = self.output_anchor_from_s0(s0)
+            state_pred = s0_anchor + t_col * state_delta
+        else:
+            state_pred = state_delta
         return {
             "pos": pos,
             "vel": vel,

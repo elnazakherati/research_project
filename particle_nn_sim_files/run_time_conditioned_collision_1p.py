@@ -453,6 +453,30 @@ def evaluate(
     }
 
 
+@torch.no_grad()
+def evaluate_t0_anchor_error(
+    model: TimeConditionedCollisionModel,
+    loader: DataLoader,
+    device: str,
+) -> float:
+    """
+    Sanity metric:
+      mean ||s_hat(0) - s0_anchor||_2 in model output space.
+    """
+    model.eval()
+    errs: list[np.ndarray] = []
+    for s0, t_q, _, _ in loader:
+        s0 = s0.to(device)
+        t0 = torch.zeros_like(t_q, device=device)
+        out0 = model(s0, t0)
+        s0_anchor = model.output_anchor_from_s0(s0)
+        err = torch.linalg.norm(out0["state"] - s0_anchor, dim=1)
+        errs.append(err.cpu().numpy().astype(np.float32))
+    if len(errs) == 0:
+        return 0.0
+    return float(np.mean(np.concatenate(errs, axis=0)))
+
+
 def plot_state_and_event_over_time(
     t_query: np.ndarray,
     true_state: np.ndarray,
@@ -695,6 +719,7 @@ def main() -> None:
         dropout=args.dropout,
         model_variant=args.model_variant,
         alpha_gate=args.alpha_gate,
+        enforce_t0_anchor=(args.model_variant == "simple_tcno"),
         time_encoding=TimeEncodingConfig(
             mode=args.time_encoding_mode,
             num_frequencies=args.num_frequencies,
@@ -717,6 +742,7 @@ def main() -> None:
                 "dropout": model_cfg.dropout,
                 "model_variant": model_cfg.model_variant,
                 "alpha_gate": model_cfg.alpha_gate,
+                "enforce_t0_anchor": model_cfg.enforce_t0_anchor,
                 "time_encoding_mode": model_cfg.time_encoding.mode,
                 "base_frequency": model_cfg.time_encoding.base_frequency,
                 "include_raw_time": model_cfg.time_encoding.include_raw_time,
@@ -752,6 +778,7 @@ def main() -> None:
                     "dropout": model_cfg.dropout,
                     "model_variant": model_cfg.model_variant,
                     "alpha_gate": model_cfg.alpha_gate,
+                    "enforce_t0_anchor": model_cfg.enforce_t0_anchor,
                     "time_encoding_mode": model_cfg.time_encoding.mode,
                     "base_frequency": model_cfg.time_encoding.base_frequency,
                     "include_raw_time": model_cfg.time_encoding.include_raw_time,
@@ -897,6 +924,19 @@ def main() -> None:
     test_loader = DataLoader(test_ds, batch_size=train_cfg.batch_size, shuffle=False)
 
     model = TimeConditionedCollisionModel(model_cfg).to(device)
+    # If input/output normalizers differ, map input s0-space to output state-space
+    # so the t=0 anchor is consistent with training target space.
+    if s0_std is not None and y_std is not None:
+        s0_mean = np.asarray(s0_std.mean, dtype=np.float32).reshape(1, 4)
+        s0_stdv = np.asarray(s0_std.std, dtype=np.float32).reshape(1, 4)
+        y_mean = np.asarray(y_std.mean, dtype=np.float32).reshape(1, 4)
+        y_stdv = np.asarray(y_std.std, dtype=np.float32).reshape(1, 4)
+        anchor_scale = s0_stdv / y_stdv
+        anchor_bias = (s0_mean - y_mean) / y_stdv
+        model.set_s0_anchor_affine(
+            torch.from_numpy(anchor_scale).to(device=device, dtype=torch.float32),
+            torch.from_numpy(anchor_bias).to(device=device, dtype=torch.float32),
+        )
     opt = torch.optim.Adam(model.parameters(), lr=train_cfg.lr, weight_decay=1e-6)
 
     history: dict[str, list[float]] = {
@@ -911,6 +951,9 @@ def main() -> None:
         "val_velocity_mse": [],
         "val_plateau_velocity_mse": [],
         "val_event_accuracy": [],
+        "train_t0_anchor_err": [],
+        "val_t0_anchor_err": [],
+        "test_t0_anchor_err": [],
     }
     best = {"epoch": -1, "val_state_mse": float("inf"), "state_dict": None}
 
@@ -1003,6 +1046,12 @@ def main() -> None:
         history["val_velocity_mse"].append(val_metrics["velocity_mse"])
         history["val_plateau_velocity_mse"].append(val_metrics["plateau_velocity_mse"])
         history["val_event_accuracy"].append(val_metrics["event_accuracy"])
+        train_t0_err = evaluate_t0_anchor_error(model=model, loader=train_loader, device=device)
+        val_t0_err = evaluate_t0_anchor_error(model=model, loader=val_loader, device=device)
+        test_t0_err = evaluate_t0_anchor_error(model=model, loader=test_loader, device=device)
+        history["train_t0_anchor_err"].append(train_t0_err)
+        history["val_t0_anchor_err"].append(val_t0_err)
+        history["test_t0_anchor_err"].append(test_t0_err)
 
         if val_metrics["state_mse"] < best["val_state_mse"]:
             best["val_state_mse"] = val_metrics["state_mse"]
@@ -1028,6 +1077,9 @@ def main() -> None:
                     "val_event_recall": val_metrics["event_recall"],
                     "val_sign_acc_vx": val_metrics["sign_acc_vx"],
                     "val_sign_acc_vy": val_metrics["sign_acc_vy"],
+                    "train_t0_anchor_err": train_t0_err,
+                    "val_t0_anchor_err": val_t0_err,
+                    "test_t0_anchor_err": test_t0_err,
                     "test_state_mse": test_metrics["state_mse"],
                     "test_position_mse": test_metrics["position_mse"],
                     "test_velocity_mse": test_metrics["velocity_mse"],
@@ -1044,7 +1096,7 @@ def main() -> None:
 
         print(
             f"Epoch {ep:04d} | train_total={train_total:.6f} pos={train_pos:.6f} vel={train_vel:.6f} evt={train_evt:.6f} sign={train_sign:.6f} flat={train_flat:.6f} "
-            f"| val_state={val_metrics['state_mse']:.6f} val_evt_acc={val_metrics['event_accuracy']:.4f} "
+            f"| val_state={val_metrics['state_mse']:.6f} val_evt_acc={val_metrics['event_accuracy']:.4f} val_t0={val_t0_err:.3e} "
             f"| test_state={test_metrics['state_mse']:.6f} test_evt_acc={test_metrics['event_accuracy']:.4f} "
             f"| best_epoch={best['epoch']}"
         )
@@ -1150,6 +1202,7 @@ def main() -> None:
                 "dropout": model_cfg.dropout,
                 "model_variant": model_cfg.model_variant,
                 "alpha_gate": model_cfg.alpha_gate,
+                "enforce_t0_anchor": model_cfg.enforce_t0_anchor,
                 "time_encoding_mode": model_cfg.time_encoding.mode,
                 "base_frequency": model_cfg.time_encoding.base_frequency,
                 "include_raw_time": model_cfg.time_encoding.include_raw_time,
@@ -1172,6 +1225,7 @@ def main() -> None:
             "dropout": model_cfg.dropout,
             "model_variant": model_cfg.model_variant,
             "alpha_gate": model_cfg.alpha_gate,
+            "enforce_t0_anchor": model_cfg.enforce_t0_anchor,
             "time_encoding_mode": model_cfg.time_encoding.mode,
             "base_frequency": model_cfg.time_encoding.base_frequency,
             "include_raw_time": model_cfg.time_encoding.include_raw_time,
@@ -1209,6 +1263,9 @@ def main() -> None:
         wandb_run.summary["final_test_event_accuracy"] = final_test["event_accuracy"]
         wandb_run.summary["final_test_event_precision"] = final_test["event_precision"]
         wandb_run.summary["final_test_event_recall"] = final_test["event_recall"]
+        wandb_run.summary["final_train_t0_anchor_err"] = history["train_t0_anchor_err"][-1] if history["train_t0_anchor_err"] else 0.0
+        wandb_run.summary["final_val_t0_anchor_err"] = history["val_t0_anchor_err"][-1] if history["val_t0_anchor_err"] else 0.0
+        wandb_run.summary["final_test_t0_anchor_err"] = history["test_t0_anchor_err"][-1] if history["test_t0_anchor_err"] else 0.0
         wandb_run.finish()
 
     print("Run complete.")
