@@ -148,6 +148,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fps", type=int, default=50)
     p.add_argument("--frame-stride", type=int, default=1)
     p.add_argument("--sign-epsilon", type=float, default=1e-6)
+    p.add_argument("--plateau-event-threshold", type=float, default=0.1)
     p.add_argument("--out-dir", type=str, default="checkpoints/eval_tc_collision_1p")
     return p.parse_args()
 
@@ -502,6 +503,12 @@ def main() -> None:
     state_mse = float(np.mean((pred_all - true_all) ** 2))
     pos_mse = float(np.mean((pred_all[:, :2] - true_all[:, :2]) ** 2))
     vel_mse = float(np.mean((pred_all[:, 2:] - true_all[:, 2:]) ** 2))
+    plateau_mask = evt_all < float(args.plateau_event_threshold)
+    plateau_vel_mse = (
+        float(np.mean((pred_all[plateau_mask, 2:] - true_all[plateau_mask, 2:]) ** 2))
+        if np.any(plateau_mask)
+        else vel_mse
+    )
     evt_metrics = compute_event_metrics(
         logits=logits_all,
         labels=evt_all,
@@ -521,6 +528,7 @@ def main() -> None:
         "state_mse": state_mse,
         "position_mse": pos_mse,
         "velocity_mse": vel_mse,
+        "plateau_velocity_mse": plateau_vel_mse,
         **evt_metrics,
         **sign_metrics,
         "rows": rows,
@@ -535,7 +543,8 @@ def main() -> None:
     print("Summary:", out_dir / "eval_summary.json")
     print(
         f"Aggregate | state_mse={summary['state_mse']:.6f} pos_mse={summary['position_mse']:.6f} "
-        f"vel_mse={summary['velocity_mse']:.6f} evt_acc={summary['event_accuracy']:.4f} "
+        f"vel_mse={summary['velocity_mse']:.6f} vel_mse_plateau={summary['plateau_velocity_mse']:.6f} "
+        f"evt_acc={summary['event_accuracy']:.4f} "
         f"sign_vx={summary['sign_acc_vx']:.4f} sign_vy={summary['sign_acc_vy']:.4f} "
         f"| ttf_median={summary['ttf_median']:.2f} ttf_p10={summary['ttf_p10']:.2f} "
         f"divergence_rate={summary['divergence_rate']:.3f}"

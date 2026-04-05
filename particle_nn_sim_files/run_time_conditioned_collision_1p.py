@@ -29,9 +29,10 @@ from particle_nn_sim.time_conditioned_collision_model import (
 @dataclass
 class LossWeights:
     lambda_pos: float = 1.0
-    lambda_vel: float = 3.0
+    lambda_vel: float = 4.0
     lambda_event: float = 1.0
     lambda_sign: float = 1.0
+    lambda_flat: float = 1.0
 
 
 @dataclass
@@ -44,6 +45,9 @@ class TrainConfig:
     train_split: float = 0.7
     val_split: float = 0.15
     normalize: bool = True
+    use_flat_velocity_reg: bool = True
+    flat_dt: float = 0.01
+    plateau_event_threshold: float = 0.1
 
 
 @dataclass
@@ -58,11 +62,13 @@ class DataConfig:
     wall_collision_mode: str = "clamp"
     coll_epsilon_steps: int = 2
     event_target_mode: str = "gaussian"  # {"window","gaussian"}
-    event_window: float = 0.05
-    sigma_event: float = 0.03
+    event_window: float = 0.04
+    sigma_event: float = 0.02
     use_collision_oversampling: bool = True
     collision_sample_fraction: float = 0.6
+    free_flight_sample_fraction: float = 0.25
     collision_window: float = 0.05
+    prepost_window: float = 0.08
     # Optional IC controls to match existing workflows.
     fixed_x: float | None = None
     fixed_y: float | None = None
@@ -250,7 +256,9 @@ def build_query_samples(
     sigma_event: float = 0.03,
     use_collision_oversampling: bool = True,
     collision_sample_fraction: float = 0.6,
+    free_flight_sample_fraction: float = 0.25,
     collision_window: float = 0.05,
+    prepost_window: float = 0.08,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Builds samples:
@@ -284,23 +292,52 @@ def build_query_samples(
 
         idx_all = np.arange(T, dtype=np.int64)
         if use_collision_oversampling and len(collision_steps) > 0:
-            window_steps = int(np.ceil(float(collision_window) / float(dt)))
+            # Build three sampling bands:
+            # 1) near-collision frames
+            # 2) just-before/after-collision ring
+            # 3) free-flight interior frames
+            near_steps = int(np.ceil(float(collision_window) / float(dt)))
+            prepost_steps = max(near_steps, int(np.ceil(float(prepost_window) / float(dt))))
+
             near_mask = np.zeros((T,), dtype=bool)
+            prepost_mask = np.zeros((T,), dtype=bool)
             for c in collision_steps:
-                lo = int(max(0, int(c) - window_steps))
-                hi = int(min(T - 1, int(c) + window_steps))
-                near_mask[lo : hi + 1] = True
+                lo_n = int(max(0, int(c) - near_steps))
+                hi_n = int(min(T - 1, int(c) + near_steps))
+                near_mask[lo_n : hi_n + 1] = True
+
+                lo_pp = int(max(0, int(c) - prepost_steps))
+                hi_pp = int(min(T - 1, int(c) + prepost_steps))
+                prepost_mask[lo_pp : hi_pp + 1] = True
+
+            prepost_mask &= ~near_mask
+            free_mask = ~(near_mask | prepost_mask)
+
             near_idx = idx_all[near_mask]
-            if len(near_idx) > 0:
-                n_total = T
-                n_coll = int(np.round(float(collision_sample_fraction) * n_total))
-                n_coll = int(np.clip(n_coll, 0, n_total))
-                n_uni = n_total - n_coll
-                coll_draw = np.random.choice(near_idx, size=n_coll, replace=True) if n_coll > 0 else np.empty((0,), dtype=np.int64)
-                uni_draw = np.random.choice(idx_all, size=n_uni, replace=True) if n_uni > 0 else np.empty((0,), dtype=np.int64)
-                idx_use = np.concatenate([coll_draw, uni_draw], axis=0)
-            else:
-                idx_use = idx_all
+            prepost_idx = idx_all[prepost_mask]
+            free_idx = idx_all[free_mask]
+
+            n_total = T
+            n_coll = int(np.round(float(collision_sample_fraction) * n_total))
+            n_coll = int(np.clip(n_coll, 0, n_total))
+            n_free = int(np.round(float(free_flight_sample_fraction) * n_total))
+            n_free = int(np.clip(n_free, 0, n_total - n_coll))
+            n_prepost = max(0, n_total - n_coll - n_free)
+
+            def _draw(pool: np.ndarray, n: int) -> np.ndarray:
+                if n <= 0:
+                    return np.empty((0,), dtype=np.int64)
+                src = pool if len(pool) > 0 else idx_all
+                return np.random.choice(src, size=n, replace=True).astype(np.int64)
+
+            coll_draw = _draw(near_idx, n_coll)
+            prepost_draw = _draw(prepost_idx, n_prepost)
+            free_draw = _draw(free_idx, n_free)
+            idx_use = np.concatenate([coll_draw, prepost_draw, free_draw], axis=0)
+            if len(idx_use) < n_total:
+                pad = np.random.choice(idx_all, size=(n_total - len(idx_use)), replace=True).astype(np.int64)
+                idx_use = np.concatenate([idx_use, pad], axis=0)
+            np.random.shuffle(idx_use)
         else:
             idx_use = idx_all
 
@@ -365,6 +402,7 @@ def evaluate(
     state_std: Standardizer | None,
     event_threshold: float = 0.5,
     sign_epsilon: float = 1e-6,
+    plateau_event_threshold: float = 0.1,
 ) -> dict[str, float]:
     model.eval()
     state_preds: list[np.ndarray] = []
@@ -399,10 +437,17 @@ def evaluate(
     state_mse = float(np.mean((pred_s - true_s) ** 2))
     evt = compute_event_metrics(logits=logits, labels=y_evt, threshold=event_threshold)
     sign_metrics = compute_sign_accuracy(pred_s[:, 2:], true_s[:, 2:], sign_epsilon=sign_epsilon)
+    free_mask = y_evt < float(plateau_event_threshold)
+    plateau_vel_mse = (
+        float(np.mean((pred_s[free_mask, 2:] - true_s[free_mask, 2:]) ** 2))
+        if np.any(free_mask)
+        else vel_mse
+    )
     return {
         "state_mse": state_mse,
         "position_mse": pos_mse,
         "velocity_mse": vel_mse,
+        "plateau_velocity_mse": plateau_vel_mse,
         **evt,
         **sign_metrics,
     }
@@ -417,8 +462,8 @@ def plot_state_and_event_over_time(
     gate: np.ndarray | None,
     out_path: Path,
 ) -> None:
-    n_rows = 6 if gate is not None else 5
-    fig, axs = plt.subplots(n_rows, 1, figsize=(10, 14 if gate is not None else 12), sharex=True)
+    n_rows = 7 if gate is not None else 6
+    fig, axs = plt.subplots(n_rows, 1, figsize=(10, 15 if gate is not None else 13), sharex=True)
     labels = ["x(t)", "y(t)", "vx(t)", "vy(t)"]
     for i in range(4):
         axs[i].plot(t_query, true_state[:, i], lw=2, label="true")
@@ -427,7 +472,14 @@ def plot_state_and_event_over_time(
         axs[i].grid(True, alpha=0.3)
         if i == 0:
             axs[i].legend(loc="best")
-    evt_ax = axs[4]
+
+    vel_err = np.linalg.norm(pred_state[:, 2:] - true_state[:, 2:], axis=1)
+    vel_err_ax = axs[4]
+    vel_err_ax.plot(t_query, vel_err, lw=1.8, color="tab:red")
+    vel_err_ax.set_ylabel("||v_err||")
+    vel_err_ax.grid(True, alpha=0.3)
+
+    evt_ax = axs[5]
     evt_ax.plot(t_query, event_prob, lw=2, label="pred event prob")
     evt_ax.plot(t_query, event_target, lw=1.5, alpha=0.75, label="event target")
     evt_ax.set_ylabel("event")
@@ -435,7 +487,7 @@ def plot_state_and_event_over_time(
     evt_ax.grid(True, alpha=0.3)
     evt_ax.legend(loc="best")
     if gate is not None:
-        gate_ax = axs[5]
+        gate_ax = axs[6]
         gate_ax.plot(t_query, gate, lw=2, label="gate(t)")
         gate_ax.set_ylabel("gate")
         gate_ax.set_xlabel("time (s)")
@@ -463,11 +515,13 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--wall-collision-mode", type=str, default="clamp", choices=["clamp", "exact"])
     p.add_argument("--coll-epsilon-steps", type=int, default=2)
     p.add_argument("--event-target-mode", type=str, default="gaussian", choices=["window", "gaussian"])
-    p.add_argument("--event-window", type=float, default=0.05)
-    p.add_argument("--sigma-event", type=float, default=0.03)
+    p.add_argument("--event-window", type=float, default=0.04)
+    p.add_argument("--sigma-event", type=float, default=0.02)
     p.add_argument("--use-collision-oversampling", type=str2bool, default=True)
     p.add_argument("--collision-sample-fraction", type=float, default=0.6)
+    p.add_argument("--free-flight-sample-fraction", type=float, default=0.25)
     p.add_argument("--collision-window", type=float, default=0.05)
+    p.add_argument("--prepost-window", type=float, default=0.08)
 
     p.add_argument("--fixed-x", type=float, default=None)
     p.add_argument("--fixed-y", type=float, default=None)
@@ -503,9 +557,10 @@ def make_parser() -> argparse.ArgumentParser:
 
     # Loss.
     p.add_argument("--lambda-pos", type=float, default=1.0)
-    p.add_argument("--lambda-vel", type=float, default=3.0)
+    p.add_argument("--lambda-vel", type=float, default=4.0)
     p.add_argument("--lambda-event", type=float, default=1.0)
     p.add_argument("--lambda-sign", type=float, default=1.0)
+    p.add_argument("--lambda-flat", type=float, default=1.0)
 
     # Train.
     p.add_argument("--epochs", type=int, default=200)
@@ -514,6 +569,9 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--train-split", type=float, default=0.7)
     p.add_argument("--val-split", type=float, default=0.15)
     p.add_argument("--normalize", type=str2bool, default=True)
+    p.add_argument("--use-flat-velocity-reg", type=str2bool, default=True)
+    p.add_argument("--flat-dt", type=float, default=0.01)
+    p.add_argument("--plateau-event-threshold", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
 
@@ -540,8 +598,18 @@ def main() -> None:
         raise ValueError("--sigma-event must be > 0")
     if not (0.0 <= args.collision_sample_fraction <= 1.0):
         raise ValueError("--collision-sample-fraction must be in [0,1]")
+    if not (0.0 <= args.free_flight_sample_fraction <= 1.0):
+        raise ValueError("--free-flight-sample-fraction must be in [0,1]")
+    if args.collision_sample_fraction + args.free_flight_sample_fraction > 1.0:
+        raise ValueError("--collision-sample-fraction + --free-flight-sample-fraction must be <= 1")
     if args.collision_window < 0.0:
         raise ValueError("--collision-window must be >= 0")
+    if args.prepost_window < 0.0:
+        raise ValueError("--prepost-window must be >= 0")
+    if args.flat_dt < 0.0:
+        raise ValueError("--flat-dt must be >= 0")
+    if not (0.0 <= args.plateau_event_threshold <= 1.0):
+        raise ValueError("--plateau-event-threshold must be in [0,1]")
     if not (0.0 < args.train_split < 1.0):
         raise ValueError("--train-split must be in (0,1)")
     if not (0.0 <= args.val_split < 1.0):
@@ -571,7 +639,9 @@ def main() -> None:
         sigma_event=args.sigma_event,
         use_collision_oversampling=args.use_collision_oversampling,
         collision_sample_fraction=args.collision_sample_fraction,
+        free_flight_sample_fraction=args.free_flight_sample_fraction,
         collision_window=args.collision_window,
+        prepost_window=args.prepost_window,
         fixed_x=args.fixed_x,
         fixed_y=args.fixed_y,
         fixed_vx=args.fixed_vx,
@@ -599,12 +669,16 @@ def main() -> None:
         train_split=args.train_split,
         val_split=args.val_split,
         normalize=args.normalize,
+        use_flat_velocity_reg=args.use_flat_velocity_reg,
+        flat_dt=args.flat_dt,
+        plateau_event_threshold=args.plateau_event_threshold,
     )
     lw = LossWeights(
         lambda_pos=args.lambda_pos,
         lambda_vel=args.lambda_vel,
         lambda_event=args.lambda_event,
         lambda_sign=args.lambda_sign,
+        lambda_flat=args.lambda_flat,
     )
     run_cfg = RunConfig(
         out_dir=str(out_dir),
@@ -761,7 +835,9 @@ def main() -> None:
         sigma_event=data_cfg.sigma_event,
         use_collision_oversampling=data_cfg.use_collision_oversampling,
         collision_sample_fraction=data_cfg.collision_sample_fraction,
+        free_flight_sample_fraction=data_cfg.free_flight_sample_fraction,
         collision_window=data_cfg.collision_window,
+        prepost_window=data_cfg.prepost_window,
     )
     X0_val, Tq_val, Y_val, Evt_val = build_query_samples(
         pos_all=pos_all,
@@ -775,7 +851,9 @@ def main() -> None:
         sigma_event=data_cfg.sigma_event,
         use_collision_oversampling=False,
         collision_sample_fraction=data_cfg.collision_sample_fraction,
+        free_flight_sample_fraction=data_cfg.free_flight_sample_fraction,
         collision_window=data_cfg.collision_window,
+        prepost_window=data_cfg.prepost_window,
     )
     X0_te, Tq_te, Y_te, Evt_te = build_query_samples(
         pos_all=pos_all,
@@ -789,7 +867,9 @@ def main() -> None:
         sigma_event=data_cfg.sigma_event,
         use_collision_oversampling=False,
         collision_sample_fraction=data_cfg.collision_sample_fraction,
+        free_flight_sample_fraction=data_cfg.free_flight_sample_fraction,
         collision_window=data_cfg.collision_window,
+        prepost_window=data_cfg.prepost_window,
     )
     print(
         f"Sample counts: train={len(X0_tr)} val={len(X0_val)} test={len(X0_te)} "
@@ -825,9 +905,11 @@ def main() -> None:
         "train_vel_mse_loss": [],
         "train_event_bce_loss": [],
         "train_sign_bce_loss": [],
+        "train_flat_vel_reg_loss": [],
         "val_state_mse": [],
         "val_position_mse": [],
         "val_velocity_mse": [],
+        "val_plateau_velocity_mse": [],
         "val_event_accuracy": [],
     }
     best = {"epoch": -1, "val_state_mse": float("inf"), "state_dict": None}
@@ -840,6 +922,7 @@ def main() -> None:
         run_vel = 0.0
         run_evt = 0.0
         run_sign = 0.0
+        run_flat = 0.0
         n_batches = 0
         for s0, t_q, y_state, y_event in train_loader:
             s0 = s0.to(device)
@@ -854,11 +937,20 @@ def main() -> None:
             vel_mse = F.mse_loss(pred_state[:, 2:], y_state[:, 2:])
             evt_bce = F.binary_cross_entropy_with_logits(evt_logit.squeeze(1), y_event)
             sign_bce = velocity_sign_loss(pred_state[:, 2:], y_state[:, 2:], sign_epsilon=run_cfg.sign_epsilon)
+            flat_reg = pred_state.new_zeros(())
+            if train_cfg.use_flat_velocity_reg and train_cfg.flat_dt > 0.0:
+                t_pair = torch.clamp(t_q + float(train_cfg.flat_dt), min=0.0, max=float(model_cfg.time_encoding.max_time))
+                out_pair = model(s0, t_pair)
+                vel_now = pred_state[:, 2:]
+                vel_next = out_pair["state"][:, 2:]
+                away_weight = torch.clamp(1.0 - y_event, min=0.0, max=1.0).unsqueeze(1)
+                flat_reg = torch.mean(away_weight * (vel_next - vel_now) ** 2)
             loss = (
                 lw.lambda_pos * pos_mse
                 + lw.lambda_vel * vel_mse
                 + lw.lambda_event * evt_bce
                 + lw.lambda_sign * sign_bce
+                + lw.lambda_flat * flat_reg
             )
 
             opt.zero_grad(set_to_none=True)
@@ -871,6 +963,7 @@ def main() -> None:
             run_vel += float(vel_mse.item())
             run_evt += float(evt_bce.item())
             run_sign += float(sign_bce.item())
+            run_flat += float(flat_reg.item())
             n_batches += 1
 
         train_total = run_total / max(1, n_batches)
@@ -878,6 +971,7 @@ def main() -> None:
         train_vel = run_vel / max(1, n_batches)
         train_evt = run_evt / max(1, n_batches)
         train_sign = run_sign / max(1, n_batches)
+        train_flat = run_flat / max(1, n_batches)
 
         val_metrics = evaluate(
             model=model,
@@ -886,6 +980,7 @@ def main() -> None:
             state_std=y_std,
             event_threshold=run_cfg.event_prob_threshold,
             sign_epsilon=run_cfg.sign_epsilon,
+            plateau_event_threshold=train_cfg.plateau_event_threshold,
         )
         test_metrics = evaluate(
             model=model,
@@ -894,6 +989,7 @@ def main() -> None:
             state_std=y_std,
             event_threshold=run_cfg.event_prob_threshold,
             sign_epsilon=run_cfg.sign_epsilon,
+            plateau_event_threshold=train_cfg.plateau_event_threshold,
         )
 
         history["train_total_loss"].append(train_total)
@@ -901,9 +997,11 @@ def main() -> None:
         history["train_vel_mse_loss"].append(train_vel)
         history["train_event_bce_loss"].append(train_evt)
         history["train_sign_bce_loss"].append(train_sign)
+        history["train_flat_vel_reg_loss"].append(train_flat)
         history["val_state_mse"].append(val_metrics["state_mse"])
         history["val_position_mse"].append(val_metrics["position_mse"])
         history["val_velocity_mse"].append(val_metrics["velocity_mse"])
+        history["val_plateau_velocity_mse"].append(val_metrics["plateau_velocity_mse"])
         history["val_event_accuracy"].append(val_metrics["event_accuracy"])
 
         if val_metrics["state_mse"] < best["val_state_mse"]:
@@ -920,9 +1018,11 @@ def main() -> None:
                     "train_vel_mse_loss": train_vel,
                     "train_event_bce_loss": train_evt,
                     "train_sign_bce_loss": train_sign,
+                    "train_flat_vel_reg_loss": train_flat,
                     "val_state_mse": val_metrics["state_mse"],
                     "val_position_mse": val_metrics["position_mse"],
                     "val_velocity_mse": val_metrics["velocity_mse"],
+                    "val_plateau_velocity_mse": val_metrics["plateau_velocity_mse"],
                     "val_event_accuracy": val_metrics["event_accuracy"],
                     "val_event_precision": val_metrics["event_precision"],
                     "val_event_recall": val_metrics["event_recall"],
@@ -931,6 +1031,7 @@ def main() -> None:
                     "test_state_mse": test_metrics["state_mse"],
                     "test_position_mse": test_metrics["position_mse"],
                     "test_velocity_mse": test_metrics["velocity_mse"],
+                    "test_plateau_velocity_mse": test_metrics["plateau_velocity_mse"],
                     "test_event_accuracy": test_metrics["event_accuracy"],
                     "test_event_precision": test_metrics["event_precision"],
                     "test_event_recall": test_metrics["event_recall"],
@@ -942,7 +1043,7 @@ def main() -> None:
             )
 
         print(
-            f"Epoch {ep:04d} | train_total={train_total:.6f} pos={train_pos:.6f} vel={train_vel:.6f} evt={train_evt:.6f} sign={train_sign:.6f} "
+            f"Epoch {ep:04d} | train_total={train_total:.6f} pos={train_pos:.6f} vel={train_vel:.6f} evt={train_evt:.6f} sign={train_sign:.6f} flat={train_flat:.6f} "
             f"| val_state={val_metrics['state_mse']:.6f} val_evt_acc={val_metrics['event_accuracy']:.4f} "
             f"| test_state={test_metrics['state_mse']:.6f} test_evt_acc={test_metrics['event_accuracy']:.4f} "
             f"| best_epoch={best['epoch']}"
@@ -952,9 +1053,15 @@ def main() -> None:
         model.load_state_dict(best["state_dict"])
 
     # Final metrics using best-by-val model.
-    final_train = evaluate(model, train_loader, device, y_std, run_cfg.event_prob_threshold, run_cfg.sign_epsilon)
-    final_val = evaluate(model, val_loader, device, y_std, run_cfg.event_prob_threshold, run_cfg.sign_epsilon)
-    final_test = evaluate(model, test_loader, device, y_std, run_cfg.event_prob_threshold, run_cfg.sign_epsilon)
+    final_train = evaluate(
+        model, train_loader, device, y_std, run_cfg.event_prob_threshold, run_cfg.sign_epsilon, train_cfg.plateau_event_threshold
+    )
+    final_val = evaluate(
+        model, val_loader, device, y_std, run_cfg.event_prob_threshold, run_cfg.sign_epsilon, train_cfg.plateau_event_threshold
+    )
+    final_test = evaluate(
+        model, test_loader, device, y_std, run_cfg.event_prob_threshold, run_cfg.sign_epsilon, train_cfg.plateau_event_threshold
+    )
 
     # Visualization for one test episode.
     plot_ep_local = int(np.clip(run_cfg.plot_episode_idx, 0, len(test_eps) - 1))
@@ -1098,6 +1205,7 @@ def main() -> None:
         wandb_run.summary["final_test_state_mse"] = final_test["state_mse"]
         wandb_run.summary["final_test_position_mse"] = final_test["position_mse"]
         wandb_run.summary["final_test_velocity_mse"] = final_test["velocity_mse"]
+        wandb_run.summary["final_test_plateau_velocity_mse"] = final_test["plateau_velocity_mse"]
         wandb_run.summary["final_test_event_accuracy"] = final_test["event_accuracy"]
         wandb_run.summary["final_test_event_precision"] = final_test["event_precision"]
         wandb_run.summary["final_test_event_recall"] = final_test["event_recall"]
