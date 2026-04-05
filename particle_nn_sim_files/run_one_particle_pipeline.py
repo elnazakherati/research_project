@@ -92,6 +92,12 @@ def parse_args():
     p.add_argument("--hidden", type=int, default=128)
     p.add_argument("--blocks", type=int, default=3)
     p.add_argument("--dropout", type=float, default=0.05)
+    p.add_argument(
+        "--separate-state-heads",
+        type=str2bool,
+        default=False,
+        help="Use separate output heads for position (x,y) and velocity (vx,vy) in ResMLP.",
+    )
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch-size", type=int, default=512)
@@ -612,6 +618,7 @@ def main():
             "episodes_per_bucket": args.episodes_per_bucket,
             "epochs": args.epochs,
             "batch_size": args.batch_size,
+            "separate_state_heads": args.separate_state_heads,
             "speed_max": args.speed_max,
             "fixed_speed": args.fixed_speed,
             "multistep_horizon": args.multistep_horizon,
@@ -791,6 +798,7 @@ def main():
         out_dim=4,
         blocks=args.blocks,
         dropout=args.dropout,
+        separate_state_heads=args.separate_state_heads,
     )
     model, stats, hist, best = train_multistep_1p(
         model,
@@ -925,6 +933,7 @@ def main():
             "out_dim": 4,
             "blocks": args.blocks,
             "dropout": args.dropout,
+            "separate_state_heads": args.separate_state_heads,
         },
         "hist": hist,
         "stats": stats,

@@ -86,8 +86,19 @@ class ResMLP(nn.Module):
     Residual MLP for dynamics learning.
     Learns corrections on top of free-flight / residual targets.
     """
-    def __init__(self, in_dim=12, hidden=256, out_dim=8, blocks=3, dropout=0.0):
+    def __init__(
+        self,
+        in_dim=12,
+        hidden=256,
+        out_dim=8,
+        blocks=3,
+        dropout=0.0,
+        separate_state_heads=False,
+    ):
         super().__init__()
+        if out_dim != 4:
+            raise ValueError(f"ResMLP expects out_dim=4 for [x,y,vx,vy], got {out_dim}")
+        self.separate_state_heads = bool(separate_state_heads)
 
         self.in_proj = nn.Linear(in_dim, hidden)
 
@@ -103,7 +114,14 @@ class ResMLP(nn.Module):
         ])
 
         self.out_norm = nn.LayerNorm(hidden)
-        self.out = nn.Linear(hidden, out_dim)
+        if self.separate_state_heads:
+            self.pos_head = nn.Linear(hidden, 2)
+            self.vel_head = nn.Linear(hidden, 2)
+            self.out = None
+        else:
+            self.out = nn.Linear(hidden, out_dim)
+            self.pos_head = None
+            self.vel_head = None
 
         # Good initialization for residual nets
         for m in self.modules():
@@ -116,4 +134,8 @@ class ResMLP(nn.Module):
         for blk in self.blocks:
             h = h + blk(h)   # residual connection
         h = self.out_norm(h)
+        if self.separate_state_heads:
+            pos = self.pos_head(h)
+            vel = self.vel_head(h)
+            return torch.cat([pos, vel], dim=1)
         return self.out(h)
