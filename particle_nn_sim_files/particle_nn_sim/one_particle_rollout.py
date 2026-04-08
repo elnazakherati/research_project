@@ -34,7 +34,7 @@ def nn_rollout_residual_1p(
 
     for t in range(steps):
         x_raw = np.array(
-            [pos_t[0], pos_t[1], vel_t[0], vel_t[1], float(radius), float(mass)],
+            [pos_t[0], pos_t[1], vel_t[0], vel_t[1]],
             dtype=np.float32,
         )
         x_n = ((x_raw[None, :] - x_mean) / x_std).astype(np.float32)

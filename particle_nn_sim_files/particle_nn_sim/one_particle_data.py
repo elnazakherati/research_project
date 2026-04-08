@@ -322,7 +322,14 @@ def collect_episodes_1p(
     return pos_all, vel_all, coll_all, meta
 
 
-def episodes_to_XY_residual_1p(pos_all, vel_all, coll_all, meta, episode_indices):
+def episodes_to_XY_residual_1p(
+    pos_all,
+    vel_all,
+    coll_all,
+    meta,
+    episode_indices,
+    include_radius_mass=True,
+):
     dt = float(meta["dt"])
     radius = float(np.asarray(meta["radii"], dtype=np.float32)[0])
     mass = float(np.asarray(meta["masses"], dtype=np.float32)[0])
@@ -340,14 +347,16 @@ def episodes_to_XY_residual_1p(pos_all, vel_all, coll_all, meta, episode_indices
         vel_n = vel[1:, 0, :]
 
         Tm1 = pos_t.shape[0]
-        X = np.zeros((Tm1, 6), dtype=np.float32)
+        in_dim = 6 if bool(include_radius_mass) else 4
+        X = np.zeros((Tm1, in_dim), dtype=np.float32)
         Y_next = np.zeros((Tm1, 4), dtype=np.float32)
         Y_free = np.zeros((Tm1, 4), dtype=np.float32)
 
         X[:, 0:2] = pos_t
         X[:, 2:4] = vel_t
-        X[:, 4] = radius
-        X[:, 5] = mass
+        if bool(include_radius_mass):
+            X[:, 4] = radius
+            X[:, 5] = mass
 
         Y_next[:, 0:2] = pos_n
         Y_next[:, 2:4] = vel_n

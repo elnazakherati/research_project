@@ -324,8 +324,6 @@ def train_multistep_1p(
     y_mean_t = torch.as_tensor(y_mean, dtype=torch.float32, device=device)
     y_std_t = torch.as_tensor(y_std, dtype=torch.float32, device=device)
     dt_t = float(dt)
-    r_t = float(radius)
-    m_t = float(mass)
     W_t = float(box_W)
     H_t = float(box_H)
     cw = float(collision_weight)
@@ -365,11 +363,9 @@ def train_multistep_1p(
                     x_raw = torch.cat(
                         [
                             state,
-                            torch.full((B, 1), r_t, device=device),
-                            torch.full((B, 1), m_t, device=device),
                         ],
                         dim=1,
-                    )  # (B,6)
+                    )  # (B,4)
                     x_n = (x_raw - x_mean_t) / x_std_t
                     resid_n = model(x_n)
                     resid = resid_n * y_std_t + y_mean_t  # (B,4)
@@ -435,8 +431,6 @@ def train_multistep_1p(
                 x_raw = torch.cat(
                     [
                         state,
-                        torch.full((B, 1), r_t, device=device),
-                        torch.full((B, 1), m_t, device=device),
                     ],
                     dim=1,
                 )
@@ -747,9 +741,23 @@ def main():
     if len(test_eps) == 0:
         raise ValueError("No test episodes. Lower --train-split or increase --episodes.")
 
-    Xtr, Ytr, Ctr = episodes_to_XY_residual_1p(pos_all, vel_all, coll_all, meta, train_eps)
-    Xte, Yte, Cte = episodes_to_XY_residual_1p(pos_all, vel_all, coll_all, meta, test_eps)
-    if Xtr.shape[1] != 6 or Ytr.shape[1] != 4:
+    Xtr, Ytr, Ctr = episodes_to_XY_residual_1p(
+        pos_all,
+        vel_all,
+        coll_all,
+        meta,
+        train_eps,
+        include_radius_mass=False,
+    )
+    Xte, Yte, Cte = episodes_to_XY_residual_1p(
+        pos_all,
+        vel_all,
+        coll_all,
+        meta,
+        test_eps,
+        include_radius_mass=False,
+    )
+    if Xtr.shape[1] != 4 or Ytr.shape[1] != 4:
         raise RuntimeError(f"Unexpected shapes: Xtr={Xtr.shape}, Ytr={Ytr.shape}")
 
     x_mean, x_std = fit_standardizer(Xtr)
@@ -793,7 +801,7 @@ def main():
     )
 
     model = ResMLP(
-        in_dim=6,
+        in_dim=4,
         hidden=args.hidden,
         out_dim=4,
         blocks=args.blocks,
@@ -928,7 +936,7 @@ def main():
         "model_state_dict": model.state_dict(),
         "model_name": "ResMLP",
         "model_kwargs": {
-            "in_dim": 6,
+            "in_dim": 4,
             "hidden": args.hidden,
             "out_dim": 4,
             "blocks": args.blocks,

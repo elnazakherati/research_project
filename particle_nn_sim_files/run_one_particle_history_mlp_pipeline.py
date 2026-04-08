@@ -52,19 +52,26 @@ def set_seed(seed):
 class HistoryPosDataset(Dataset):
     """
     Input: last H positions -> shape (2H,)
-    Target: current position -> shape (2,)
+    Target: next H positions -> shape (H,2)
     """
 
-    def __init__(self, pos_all, episode_indices, history_len):
+    def __init__(self, pos_all, episode_indices, history_len, multistep_horizon=1):
         self.pos_all = np.asarray(pos_all, dtype=np.float32)  # (E,T,1,2)
         self.episode_indices = np.asarray(episode_indices, dtype=np.int64)
         self.history_len = int(history_len)
+        self.multistep_horizon = int(multistep_horizon)
         self.T = self.pos_all.shape[1]
         if self.history_len < 1:
             raise ValueError("history_len must be >= 1")
-        if self.T <= self.history_len:
-            raise ValueError(f"Need T > history_len, got T={self.T}, history_len={self.history_len}")
-        self.starts_per_episode = self.T - self.history_len
+        if self.multistep_horizon < 1:
+            raise ValueError("multistep_horizon must be >= 1")
+        min_T = self.history_len + self.multistep_horizon
+        if self.T < min_T:
+            raise ValueError(
+                f"Need T >= history_len + multistep_horizon, got T={self.T}, "
+                f"history_len={self.history_len}, multistep_horizon={self.multistep_horizon}"
+            )
+        self.starts_per_episode = self.T - self.history_len - self.multistep_horizon + 1
 
     def __len__(self):
         return len(self.episode_indices) * self.starts_per_episode
@@ -76,9 +83,9 @@ class HistoryPosDataset(Dataset):
         t = local_idx + self.history_len
 
         hist = self.pos_all[e, t - self.history_len : t, 0, :]  # (H,2)
-        target = self.pos_all[e, t, 0, :]  # (2,)
+        target = self.pos_all[e, t : t + self.multistep_horizon, 0, :]  # (K,2)
         x = hist.reshape(-1).astype(np.float32)  # (2H,)
-        y = target.astype(np.float32)
+        y = target.reshape(-1).astype(np.float32)  # (2K,)
         return torch.from_numpy(x), torch.from_numpy(y)
 
 
@@ -128,17 +135,20 @@ def rollout_history_model(model, pos_true, history_len, device):
         hist = pos_pred[t - H : t, 0, :].reshape(1, -1).astype(np.float32)
         x = torch.from_numpy(hist).to(device)
         y = model(x).cpu().numpy()[0].astype(np.float32)
-        pos_pred[t, 0, :] = y
-        if not np.isfinite(y).all():
+        # If model is multi-horizon, use first predicted step (t+1) for autoregressive rollout.
+        y1 = y[:2]
+        pos_pred[t, 0, :] = y1
+        if not np.isfinite(y1).all():
             return pos_pred[: t + 1]
     return pos_pred
 
 
-def train_model(model, train_loader, val_loader, test_loader, device, epochs, lr):
+def train_model(model, train_loader, val_loader, test_loader, device, epochs, lr, multistep_horizon):
     model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=float(lr), weight_decay=1e-6)
     history = {"train_mse_pos": [], "val_mse_pos": [], "test_mse_pos": []}
     best = {"epoch": -1, "val_mse_pos": float("inf"), "state_dict": None}
+    K = int(multistep_horizon)
 
     def eval_loader(loader):
         model.eval()
@@ -148,8 +158,9 @@ def train_model(model, train_loader, val_loader, test_loader, device, epochs, lr
             for xb, yb in loader:
                 xb = xb.to(device)
                 yb = yb.to(device)
-                pred = model(xb)
-                mse = ((pred - yb) ** 2).mean(dim=1)
+                pred = model(xb).view(-1, K, 2)
+                tgt = yb.view(-1, K, 2)
+                mse = ((pred - tgt) ** 2).mean(dim=(1, 2))
                 sse += mse.sum().item()
                 n += mse.numel()
         return sse / max(n, 1)
@@ -162,8 +173,9 @@ def train_model(model, train_loader, val_loader, test_loader, device, epochs, lr
         for xb, yb in train_loader:
             xb = xb.to(device)
             yb = yb.to(device)
-            pred = model(xb)
-            mse = ((pred - yb) ** 2).mean(dim=1)
+            pred = model(xb).view(-1, K, 2)
+            tgt = yb.view(-1, K, 2)
+            mse = ((pred - tgt) ** 2).mean(dim=(1, 2))
             loss = mse.mean()
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -226,6 +238,7 @@ def parse_args():
 
     p.add_argument("--history-len", type=int, default=10)
     p.add_argument("--width", type=int, default=1024)
+    p.add_argument("--multistep-horizon", type=int, default=1)
     p.add_argument("--epochs", type=int, default=500)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch-size", type=int, default=256)
@@ -251,6 +264,8 @@ def main():
     args = parse_args()
     if args.history_len < 1:
         raise ValueError("--history-len must be >= 1")
+    if args.multistep_horizon < 1:
+        raise ValueError("--multistep-horizon must be >= 1")
     if not (0.0 < args.train_split < 1.0):
         raise ValueError("--train-split must be in (0,1)")
     if not (0.0 <= args.val_split < 1.0):
@@ -333,14 +348,18 @@ def main():
     if len(train_eps) == 0 or len(val_eps) == 0 or len(test_eps) == 0:
         raise ValueError("Empty split encountered. Increase episodes or adjust train/val splits.")
 
-    train_ds = HistoryPosDataset(pos_all, train_eps, args.history_len)
-    val_ds = HistoryPosDataset(pos_all, val_eps, args.history_len)
-    test_ds = HistoryPosDataset(pos_all, test_eps, args.history_len)
+    train_ds = HistoryPosDataset(pos_all, train_eps, args.history_len, args.multistep_horizon)
+    val_ds = HistoryPosDataset(pos_all, val_eps, args.history_len, args.multistep_horizon)
+    test_ds = HistoryPosDataset(pos_all, test_eps, args.history_len, args.multistep_horizon)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
 
-    model = HistoryMLP(in_dim=2 * int(args.history_len), width=int(args.width), out_dim=2)
+    model = HistoryMLP(
+        in_dim=2 * int(args.history_len),
+        width=int(args.width),
+        out_dim=2 * int(args.multistep_horizon),
+    )
     model, hist, best = train_model(
         model=model,
         train_loader=train_loader,
@@ -349,6 +368,7 @@ def main():
         device=device,
         epochs=args.epochs,
         lr=args.lr,
+        multistep_horizon=args.multistep_horizon,
     )
 
     # Rollout from first test episode (autoregressive with GT seed history).
@@ -444,7 +464,11 @@ def main():
 
     ckpt = {
         "model_name": "HistoryMLP",
-        "model_kwargs": {"in_dim": 2 * int(args.history_len), "width": int(args.width), "out_dim": 2},
+        "model_kwargs": {
+            "in_dim": 2 * int(args.history_len),
+            "width": int(args.width),
+            "out_dim": 2 * int(args.multistep_horizon),
+        },
         "model_state_dict": model.state_dict(),
         "best_epoch": int(best["epoch"]),
         "best_val_mse_pos": float(best["val_mse_pos"]),
