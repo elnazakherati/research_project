@@ -70,8 +70,10 @@ def rollout_history_model(model, pos_true, history_len, device):
         hist = pos_pred[t - H : t, 0, :].reshape(1, -1).astype(np.float32)
         x = torch.from_numpy(hist).to(device)
         y = model(x).cpu().numpy()[0].astype(np.float32)
-        pos_pred[t, 0, :] = y
-        if not np.isfinite(y).all():
+        # Multi-horizon checkpoints output (2*K,). Use first step (t+1) for rollout.
+        y1 = y[:2]
+        pos_pred[t, 0, :] = y1
+        if not np.isfinite(y1).all():
             return pos_pred[: t + 1]
     return pos_pred
 
