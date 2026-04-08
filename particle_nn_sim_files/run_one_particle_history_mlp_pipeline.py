@@ -12,6 +12,10 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+try:
+    import wandb
+except Exception:
+    wandb = None
 
 from particle_nn_sim.simulator import ParticleSim2D
 from particle_nn_sim.one_particle_data import collect_episodes_1p
@@ -143,7 +147,7 @@ def rollout_history_model(model, pos_true, history_len, device):
     return pos_pred
 
 
-def train_model(model, train_loader, val_loader, test_loader, device, epochs, lr, multistep_horizon):
+def train_model(model, train_loader, val_loader, test_loader, device, epochs, lr, multistep_horizon, wb_run=None):
     model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=float(lr), weight_decay=1e-6)
     history = {"train_mse_pos": [], "val_mse_pos": [], "test_mse_pos": []}
@@ -200,6 +204,18 @@ def train_model(model, train_loader, val_loader, test_loader, device, epochs, lr
             f"Epoch {ep:04d} | train_mse_pos={train_mse:.6f} | val_mse_pos={val_mse:.6f} "
             f"| test_mse_pos={test_mse:.6f} | best_epoch={best['epoch']} | sec={time.time()-t0:.2f}"
         )
+        if wb_run is not None:
+            wb_run.log(
+                {
+                    "epoch": ep,
+                    "train_mse_pos": float(train_mse),
+                    "val_mse_pos": float(val_mse),
+                    "test_mse_pos": float(test_mse),
+                    "best_epoch_so_far": int(best["epoch"]),
+                    "best_val_mse_pos_so_far": float(best["val_mse_pos"]),
+                    "epoch_seconds": float(time.time() - t0),
+                }
+            )
 
     if best["state_dict"] is not None:
         model.load_state_dict(best["state_dict"])
@@ -257,6 +273,11 @@ def parse_args():
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", type=str, default="checkpoints/history_mlp_1p")
+    p.add_argument("--use-wandb", type=str2bool, default=False)
+    p.add_argument("--wandb-project", type=str, default="particle-nn-sim")
+    p.add_argument("--wandb-entity", type=str, default="")
+    p.add_argument("--wandb-run-name", type=str, default="")
+    p.add_argument("--wandb-tags", type=str, default="")
     return p.parse_args()
 
 
@@ -277,6 +298,18 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     device = resolve_device(args.device)
+    wb_run = None
+    if args.use_wandb:
+        if wandb is None:
+            raise ImportError("wandb is not installed, but --use-wandb=true was provided.")
+        tags = [t.strip() for t in str(args.wandb_tags).split(",") if t.strip()]
+        wb_run = wandb.init(
+            project=args.wandb_project,
+            entity=(args.wandb_entity or None),
+            name=(args.wandb_run_name or None),
+            tags=tags,
+            config=vars(args),
+        )
 
     gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else "cpu"
     print(f"Device: {device} ({gpu_name})")
@@ -369,6 +402,7 @@ def main():
         epochs=args.epochs,
         lr=args.lr,
         multistep_horizon=args.multistep_horizon,
+        wb_run=wb_run,
     )
 
     # Rollout from first test episode (autoregressive with GT seed history).
@@ -461,6 +495,12 @@ def main():
     }
     with open(out_dir / "analysis_1p.json", "w", encoding="utf-8") as f:
         json.dump(analysis, f, indent=2)
+    if wb_run is not None:
+        wb_run.summary["best_epoch"] = int(best["epoch"])
+        wb_run.summary["best_val_mse_pos"] = float(best["val_mse_pos"])
+        wb_run.summary["final_train_mse_pos"] = float(hist["train_mse_pos"][-1]) if hist["train_mse_pos"] else float("nan")
+        wb_run.summary["final_val_mse_pos"] = float(hist["val_mse_pos"][-1]) if hist["val_mse_pos"] else float("nan")
+        wb_run.summary["final_test_mse_pos"] = float(hist["test_mse_pos"][-1]) if hist["test_mse_pos"] else float("nan")
 
     ckpt = {
         "model_name": "HistoryMLP",
@@ -497,6 +537,8 @@ def main():
         print(" -", out_dir / "rollout_gt_vs_pred_overlay_1p.mp4")
     if args.save_train_episode_preview:
         print(" -", out_dir / "training_episode_example_1p.mp4")
+    if wb_run is not None:
+        wb_run.finish()
 
 
 if __name__ == "__main__":
