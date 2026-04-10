@@ -314,6 +314,7 @@ def collect_episodes_1p(
         "episodes_per_bucket": None if episodes_per_bucket is None else int(episodes_per_bucket),
         "fixed_speed": None if fixed_speed is None else float(fixed_speed),
         "speed_min": float(speed_min),
+        "speed_max": float(speed_max),
         "fixed_x": None if fixed_x is None else float(fixed_x),
         "fixed_y": None if fixed_y is None else float(fixed_y),
         "fixed_vx": None if fixed_vx is None else float(fixed_vx),

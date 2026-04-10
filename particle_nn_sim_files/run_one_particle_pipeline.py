@@ -24,6 +24,17 @@ from particle_nn_sim.one_particle_rollout import (
     save_animation_mp4,
 )
 
+# Fixed reproducible dataset (always used by this pipeline).
+_FIXED_DATASET_EPISODES = 1000
+_FIXED_DATASET_STEPS = 1000
+_FIXED_SPEED_MIN = 0.02
+_FIXED_SPEED_MAX = 0.1
+_FIXED_DATASET_SEED = 0
+_FIXED_DATASET_STRATIFIED = False
+_FIXED_DATASET_CACHE_DIR = Path(__file__).resolve().parent / "checkpoints" / "fixed_data_1p"
+_FIXED_DATASET_CACHE_PATH = _FIXED_DATASET_CACHE_DIR / "one_particle_e1000_t1000_v002_01_seed0.npz"
+_FIXED_SPLIT_CACHE_PATH = _FIXED_DATASET_CACHE_DIR / "one_particle_e1000_t1000_v002_01_seed0_split.npz"
+
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -654,39 +665,76 @@ def main():
         radii=[radius_eff],
         masses=[args.mass],
         restitution=1.0,
-        seed=args.seed,
+        seed=_FIXED_DATASET_SEED,
         wall_mode=args.wall_collision_mode,
     )
 
-    pos_all, vel_all, coll_all, meta = collect_episodes_1p(
-        sim,
-        E=args.episodes,
-        steps=args.steps,
-        dt=args.dt,
-        speed_max=args.speed_max,
-        seed=args.seed,
-        stratified_init=args.stratified_init,
-        pos_grid_n=args.pos_grid_n,
-        angle_bins=args.angle_bins,
-        episodes_per_bucket=args.episodes_per_bucket,
-        fixed_speed=args.fixed_speed,
-        fixed_x=args.fixed_x,
-        fixed_y=args.fixed_y,
-        fixed_vx=args.fixed_vx,
-        fixed_vy=args.fixed_vy,
-        fixed2_x=args.fixed2_x,
-        fixed2_y=args.fixed2_y,
-        fixed2_vx=args.fixed2_vx,
-        fixed2_vy=args.fixed2_vy,
-        ball_center_x=args.ball_center_x,
-        ball_center_y=args.ball_center_y,
-        ball_radius=args.ball_radius,
-        fixed_vel_vx=args.fixed_vel_vx,
-        fixed_vel_vy=args.fixed_vel_vy,
-    )
+    _FIXED_DATASET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if _FIXED_DATASET_CACHE_PATH.exists():
+        cached = np.load(_FIXED_DATASET_CACHE_PATH, allow_pickle=True)
+        pos_all = cached["pos_all"].astype(np.float32)
+        vel_all = cached["vel_all"].astype(np.float32)
+        coll_all = cached["coll_all"].astype(np.uint8)
+        meta = cached["meta"].item()
+        print(f"Loaded fixed dataset cache: {_FIXED_DATASET_CACHE_PATH}")
+    else:
+        pos_all, vel_all, coll_all, meta = collect_episodes_1p(
+            sim,
+            E=_FIXED_DATASET_EPISODES,
+            steps=_FIXED_DATASET_STEPS,
+            dt=args.dt,
+            speed_max=_FIXED_SPEED_MAX,
+            speed_min=_FIXED_SPEED_MIN,
+            seed=_FIXED_DATASET_SEED,
+            stratified_init=_FIXED_DATASET_STRATIFIED,
+            pos_grid_n=args.pos_grid_n,
+            angle_bins=args.angle_bins,
+            episodes_per_bucket=None,
+            fixed_speed=None,
+            fixed_x=None,
+            fixed_y=None,
+            fixed_vx=None,
+            fixed_vy=None,
+            fixed2_x=None,
+            fixed2_y=None,
+            fixed2_vx=None,
+            fixed2_vy=None,
+            ball_center_x=None,
+            ball_center_y=None,
+            ball_radius=None,
+            fixed_vel_vx=None,
+            fixed_vel_vy=None,
+        )
+        np.savez_compressed(
+            _FIXED_DATASET_CACHE_PATH,
+            pos_all=pos_all,
+            vel_all=vel_all,
+            coll_all=coll_all,
+            meta=np.array(meta, dtype=object),
+        )
+        print(f"Generated and cached fixed dataset: {_FIXED_DATASET_CACHE_PATH}")
+
+    if pos_all.shape[0] != _FIXED_DATASET_EPISODES or (pos_all.shape[1] - 1) != _FIXED_DATASET_STEPS:
+        raise ValueError(
+            "Fixed dataset cache shape mismatch. "
+            f"Expected episodes={_FIXED_DATASET_EPISODES}, steps={_FIXED_DATASET_STEPS}, "
+            f"got pos_all shape={tuple(pos_all.shape)}. "
+            f"Delete cache and rerun: {_FIXED_DATASET_CACHE_PATH}"
+        )
+    cache_speed_min = float(meta.get("speed_min", 0.0))
+    cache_speed_max = float(meta.get("speed_max", args.speed_max))
+    if not (abs(cache_speed_min - _FIXED_SPEED_MIN) < 1e-12 and abs(cache_speed_max - _FIXED_SPEED_MAX) < 1e-12):
+        raise ValueError(
+            "Fixed dataset cache speed-range mismatch. "
+            f"Expected [{_FIXED_SPEED_MIN}, {_FIXED_SPEED_MAX}] "
+            f"got [{cache_speed_min}, {cache_speed_max}]. "
+            f"Delete cache and rerun: {_FIXED_DATASET_CACHE_PATH}"
+        )
+
     print(
-        f"Generated episodes: pos_all={pos_all.shape}, vel_all={vel_all.shape}, "
-        f"collision_frames={int(coll_all.sum())}/{coll_all.size}"
+        f"Using fixed dataset: pos_all={pos_all.shape}, vel_all={vel_all.shape}, "
+        f"collision_frames={int(coll_all.sum())}/{coll_all.size}, "
+        f"speed_range=[{cache_speed_min:.3f},{cache_speed_max:.3f}]"
     )
 
     wandb_run = None
@@ -732,14 +780,22 @@ def main():
             fps=args.preview_fps,
         )
 
-    # Train/test split by episode.
+    # Fixed train/test split by episode (cached for reproducibility).
     E = pos_all.shape[0]
-    idx = np.arange(E)
-    n_train = int(args.train_split * E)
-    train_eps = idx[:n_train]
-    test_eps = idx[n_train:]
-    if len(test_eps) == 0:
-        raise ValueError("No test episodes. Lower --train-split or increase --episodes.")
+    if _FIXED_SPLIT_CACHE_PATH.exists():
+        split_cached = np.load(_FIXED_SPLIT_CACHE_PATH, allow_pickle=False)
+        train_eps = split_cached["train_eps"].astype(np.int64)
+        test_eps = split_cached["test_eps"].astype(np.int64)
+        print(f"Loaded fixed split cache: {_FIXED_SPLIT_CACHE_PATH}")
+    else:
+        idx = np.arange(E, dtype=np.int64)
+        n_train = int(args.train_split * E)
+        train_eps = idx[:n_train]
+        test_eps = idx[n_train:]
+        if len(test_eps) == 0:
+            raise ValueError("No test episodes. Lower --train-split or increase --episodes.")
+        np.savez_compressed(_FIXED_SPLIT_CACHE_PATH, train_eps=train_eps, test_eps=test_eps)
+        print(f"Created fixed split cache: {_FIXED_SPLIT_CACHE_PATH}")
 
     Xtr, Ytr, Ctr = episodes_to_XY_residual_1p(
         pos_all,
