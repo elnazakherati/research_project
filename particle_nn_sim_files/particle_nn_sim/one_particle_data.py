@@ -1,14 +1,14 @@
 import numpy as np
 
 
-def sample_init_1p(W, H, radius, speed_max=0.7, seed=None):
+def sample_init_1p(W, H, radius, speed_max=0.7, speed_min=0.0, seed=None):
     rng = np.random.default_rng(seed)
     pos = np.array(
         [rng.uniform(radius, W - radius), rng.uniform(radius, H - radius)],
         dtype=np.float32,
     )
     theta = rng.uniform(0.0, 2.0 * np.pi)
-    mag = rng.uniform(0.0, speed_max)
+    mag = rng.uniform(float(speed_min), float(speed_max))
     vel = np.array([mag * np.cos(theta), mag * np.sin(theta)], dtype=np.float32)
     return pos[None, :], vel[None, :]
 
@@ -22,6 +22,7 @@ def sample_init_1p_stratified(
     cell_idx,
     angle_idx,
     speed_max=0.7,
+    speed_min=0.0,
     fixed_speed=None,
     rng=None,
 ):
@@ -58,7 +59,7 @@ def sample_init_1p_stratified(
     theta = rng.uniform(th0, th1)
 
     if fixed_speed is None:
-        mag = rng.uniform(0.0, float(speed_max))
+        mag = rng.uniform(float(speed_min), float(speed_max))
     else:
         mag = float(fixed_speed)
     vel = np.array([mag * np.cos(theta), mag * np.sin(theta)], dtype=np.float32)
@@ -93,6 +94,7 @@ def collect_episodes_1p(
     steps=1000,
     dt=0.01,
     speed_max=0.7,
+    speed_min=0.0,
     seed=0,
     stratified_init=False,
     pos_grid_n=4,
@@ -126,6 +128,10 @@ def collect_episodes_1p(
 
     if fixed_speed is not None and float(fixed_speed) < 0.0:
         raise ValueError("fixed_speed must be >= 0 when provided")
+    if float(speed_min) < 0.0:
+        raise ValueError("speed_min must be >= 0")
+    if float(speed_min) > float(speed_max):
+        raise ValueError("speed_min must be <= speed_max")
     fixed_vel_vals = (fixed_vel_vx, fixed_vel_vy)
     use_fixed_vel = any(v is not None for v in fixed_vel_vals)
     if use_fixed_vel and not all(v is not None for v in fixed_vel_vals):
@@ -243,7 +249,7 @@ def collect_episodes_1p(
                 vel0 = np.array([[s * np.cos(th), s * np.sin(th)]], dtype=np.float32)
             else:
                 th = rng.uniform(0.0, 2.0 * np.pi)
-                mag = rng.uniform(0.0, float(speed_max))
+                mag = rng.uniform(float(speed_min), float(speed_max))
                 vel0 = np.array([[mag * np.cos(th), mag * np.sin(th)]], dtype=np.float32)
         elif bucket_schedule is None:
             pos0, vel0 = sample_init_1p(
@@ -251,6 +257,7 @@ def collect_episodes_1p(
                 H,
                 radius,
                 speed_max=speed_max,
+                speed_min=speed_min,
                 seed=rng.integers(1_000_000_000),
             )
             if fixed_speed is not None:
@@ -270,6 +277,7 @@ def collect_episodes_1p(
                 cell_idx=(int(ix), int(iy)),
                 angle_idx=int(ia),
                 speed_max=speed_max,
+                speed_min=speed_min,
                 fixed_speed=fixed_speed,
                 rng=rng,
             )
@@ -305,6 +313,7 @@ def collect_episodes_1p(
         "angle_bins": int(angle_bins),
         "episodes_per_bucket": None if episodes_per_bucket is None else int(episodes_per_bucket),
         "fixed_speed": None if fixed_speed is None else float(fixed_speed),
+        "speed_min": float(speed_min),
         "fixed_x": None if fixed_x is None else float(fixed_x),
         "fixed_y": None if fixed_y is None else float(fixed_y),
         "fixed_vx": None if fixed_vx is None else float(fixed_vx),
