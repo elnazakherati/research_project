@@ -45,8 +45,6 @@ class HistoryMLP(nn.Module):
             nn.ReLU(),
             nn.Linear(width, width),
             nn.ReLU(),
-            nn.Linear(width, width),
-            nn.ReLU(),
             nn.Linear(width, out_dim),
         )
 
