@@ -11,7 +11,6 @@ import matplotlib.pyplot as plt
 
 from particle_nn_sim.models import ResMLP
 from particle_nn_sim.simulator import ParticleSim2D
-from particle_nn_sim.one_particle_data import sample_init_1p
 from particle_nn_sim.one_particle_rollout import (
     animate_overlay_gt_perturbed_1p,
     animate_side_by_side_1p,
@@ -34,7 +33,9 @@ def str2bool(v):
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate one-particle checkpoint on new rollouts only.")
     p.add_argument("--ckpt", type=str, required=True, help="Path to model_1p_resmlp.pt")
-    p.add_argument("--num-rollouts", type=int, default=5, help="Number of new random rollouts")
+    p.add_argument("--num-rollouts", type=int, default=5, help="How many episodes from split to evaluate")
+    p.add_argument("--split", type=str, default="test", choices=["train", "test"])
+    p.add_argument("--start-idx", type=int, default=0, help="Start offset inside chosen split")
     p.add_argument("--rollout-steps", type=int, default=1000)
     p.add_argument("--speed-max", type=float, default=0.7)
     p.add_argument(
@@ -90,7 +91,8 @@ def main():
     use_fixed_ic = any(v is not None for v in fixed_ic_vals)
     if use_fixed_ic and not all(v is not None for v in fixed_ic_vals):
         raise ValueError("If any of --fixed-x/--fixed-y/--fixed-vx/--fixed-vy is set, all four must be set.")
-    rng = np.random.default_rng(args.seed)
+    if args.start_idx < 0:
+        raise ValueError("--start-idx must be >= 0")
 
     ckpt_path = Path(args.ckpt)
     out_dir = Path(args.out_dir)
@@ -111,6 +113,13 @@ def main():
     y_mean = np.asarray(ckpt["y_mean"], dtype=np.float32)
     y_std = np.asarray(ckpt["y_std"], dtype=np.float32)
     meta = ckpt["meta"]
+    split_indices = ckpt.get("split_indices", None)
+    episode_init = ckpt.get("episode_init", None)
+    if split_indices is None or episode_init is None:
+        raise RuntimeError(
+            "Checkpoint is missing split_indices/episode_init. "
+            "Use a checkpoint produced by run_one_particle_pipeline.py with split metadata."
+        )
 
     W = float(meta["W"])
     H = float(meta["H"])
@@ -130,25 +139,27 @@ def main():
     else:
         wall_mode = args.wall_collision_mode
 
+    train_eps = np.asarray(split_indices["train_eps"], dtype=np.int64)
+    test_eps = np.asarray(split_indices["test_eps"], dtype=np.int64)
+    pos0_all = np.asarray(episode_init["pos0"], dtype=np.float32)
+    vel0_all = np.asarray(episode_init["vel0"], dtype=np.float32)
+    split_eps = train_eps if args.split == "train" else test_eps
+    if len(split_eps) == 0:
+        raise RuntimeError(f"No episodes available in split '{args.split}'.")
+    end_idx = min(args.start_idx + int(args.num_rollouts), len(split_eps))
+    eval_eps = split_eps[args.start_idx:end_idx]
+    if len(eval_eps) == 0:
+        raise RuntimeError(
+            f"Requested empty episode range: split={args.split}, start={args.start_idx}, num={args.num_rollouts}"
+        )
+
     rollout_rows = []
 
-    for i in range(int(args.num_rollouts)):
-        if use_fixed_ic:
-            seed_i = int(args.seed)
-            pos0 = np.array([[float(args.fixed_x), float(args.fixed_y)]], dtype=np.float32)
-            vel0 = np.array([[float(args.fixed_vx), float(args.fixed_vy)]], dtype=np.float32)
-        else:
-            seed_i = int(rng.integers(1_000_000_000))
-            if args.fixed_speed is None:
-                pos0, vel0 = sample_init_1p(W, H, radius, speed_max=args.speed_max, seed=seed_i)
-            else:
-                rng_i = np.random.default_rng(seed_i)
-                x = rng_i.uniform(radius, W - radius)
-                y = rng_i.uniform(radius, H - radius)
-                theta = rng_i.uniform(0.0, 2.0 * np.pi)
-                s = float(args.fixed_speed)
-                pos0 = np.array([[x, y]], dtype=np.float32)
-                vel0 = np.array([[s * np.cos(theta), s * np.sin(theta)]], dtype=np.float32)
+    for i, e in enumerate(eval_eps):
+        e = int(e)
+        seed_i = 10_000 + e
+        pos0 = pos0_all[e].astype(np.float32)
+        vel0 = vel0_all[e].astype(np.float32)
 
         sim_true = ParticleSim2D(
             W=W,
@@ -186,6 +197,7 @@ def main():
 
         row = {
             "rollout_idx": int(i),
+            "episode_idx_global": int(e),
             "sample_seed": int(seed_i),
             "mean_err": float(np.mean(pos_err)),
             "max_err": float(np.max(pos_err)),
@@ -242,7 +254,7 @@ def main():
             row["error_plot"] = plot_path.name
 
             print(
-                f"[{i+1}/{args.num_rollouts}] saved {out_mp4.name} | "
+                f"[{i+1}/{len(eval_eps)}] saved {out_mp4.name} | "
                 f"mean_err={row['mean_err']:.6f} "
                 f"max_err={row['max_err']:.6f} "
                 f"final_err={row['final_err']:.6f} | "
@@ -252,7 +264,7 @@ def main():
             )
         else:
             print(
-                f"[{i+1}/{args.num_rollouts}] "
+                f"[{i+1}/{len(eval_eps)}] "
                 f"mean_err={row['mean_err']:.6f} "
                 f"max_err={row['max_err']:.6f} "
                 f"final_err={row['final_err']:.6f} | "
@@ -267,7 +279,9 @@ def main():
 
     summary = {
         "ckpt": str(ckpt_path),
-        "num_rollouts": int(args.num_rollouts),
+        "split": args.split,
+        "num_rollouts": int(len(eval_eps)),
+        "start_idx": int(args.start_idx),
         "rollout_steps": int(args.rollout_steps),
         "speed_max": float(args.speed_max),
         "fixed_speed": None if args.fixed_speed is None else float(args.fixed_speed),
