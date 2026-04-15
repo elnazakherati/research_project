@@ -40,6 +40,8 @@ class TrainConfig:
     epochs: int = 200
     batch_size: int = 512
     lr: float = 1e-3
+    lr_step_size: int = 100
+    lr_gamma: float = 0.5
     device: str = "auto"
     seed: int = 0
     train_split: float = 0.7
@@ -590,6 +592,8 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr-step-size", type=int, default=100)
+    p.add_argument("--lr-gamma", type=float, default=0.5)
     p.add_argument("--train-split", type=float, default=0.7)
     p.add_argument("--val-split", type=float, default=0.15)
     p.add_argument("--normalize", type=str2bool, default=True)
@@ -632,6 +636,10 @@ def main() -> None:
         raise ValueError("--prepost-window must be >= 0")
     if args.flat_dt < 0.0:
         raise ValueError("--flat-dt must be >= 0")
+    if args.lr_step_size < 1:
+        raise ValueError("--lr-step-size must be >= 1")
+    if not (0.0 < args.lr_gamma <= 1.0):
+        raise ValueError("--lr-gamma must be in (0,1]")
     if not (0.0 <= args.plateau_event_threshold <= 1.0):
         raise ValueError("--plateau-event-threshold must be in [0,1]")
     if not (0.0 < args.train_split < 1.0):
@@ -688,6 +696,8 @@ def main() -> None:
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        lr_step_size=args.lr_step_size,
+        lr_gamma=args.lr_gamma,
         device=args.device,
         seed=args.seed,
         train_split=args.train_split,
@@ -938,6 +948,9 @@ def main() -> None:
             torch.from_numpy(anchor_bias).to(device=device, dtype=torch.float32),
         )
     opt = torch.optim.Adam(model.parameters(), lr=train_cfg.lr, weight_decay=1e-6)
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        opt, step_size=int(train_cfg.lr_step_size), gamma=float(train_cfg.lr_gamma)
+    )
 
     history: dict[str, list[float]] = {
         "train_total_loss": [],
@@ -954,11 +967,13 @@ def main() -> None:
         "train_t0_anchor_err": [],
         "val_t0_anchor_err": [],
         "test_t0_anchor_err": [],
+        "lr": [],
     }
     best = {"epoch": -1, "val_state_mse": float("inf"), "state_dict": None}
 
     # Training loop.
     for ep in range(1, train_cfg.epochs + 1):
+        lr_now = float(opt.param_groups[0]["lr"])
         model.train()
         run_total = 0.0
         run_pos = 0.0
@@ -1052,6 +1067,7 @@ def main() -> None:
         history["train_t0_anchor_err"].append(train_t0_err)
         history["val_t0_anchor_err"].append(val_t0_err)
         history["test_t0_anchor_err"].append(test_t0_err)
+        history["lr"].append(lr_now)
 
         if val_metrics["state_mse"] < best["val_state_mse"]:
             best["val_state_mse"] = val_metrics["state_mse"]
@@ -1080,6 +1096,7 @@ def main() -> None:
                     "train_t0_anchor_err": train_t0_err,
                     "val_t0_anchor_err": val_t0_err,
                     "test_t0_anchor_err": test_t0_err,
+                    "lr": lr_now,
                     "test_state_mse": test_metrics["state_mse"],
                     "test_position_mse": test_metrics["position_mse"],
                     "test_velocity_mse": test_metrics["velocity_mse"],
@@ -1095,11 +1112,12 @@ def main() -> None:
             )
 
         print(
-            f"Epoch {ep:04d} | train_total={train_total:.6f} pos={train_pos:.6f} vel={train_vel:.6f} evt={train_evt:.6f} sign={train_sign:.6f} flat={train_flat:.6f} "
+            f"Epoch {ep:04d} | lr={lr_now:.6g} | train_total={train_total:.6f} pos={train_pos:.6f} vel={train_vel:.6f} evt={train_evt:.6f} sign={train_sign:.6f} flat={train_flat:.6f} "
             f"| val_state={val_metrics['state_mse']:.6f} val_evt_acc={val_metrics['event_accuracy']:.4f} val_t0={val_t0_err:.3e} "
             f"| test_state={test_metrics['state_mse']:.6f} test_evt_acc={test_metrics['event_accuracy']:.4f} "
             f"| best_epoch={best['epoch']}"
         )
+        scheduler.step()
 
     if best["state_dict"] is not None:
         model.load_state_dict(best["state_dict"])
