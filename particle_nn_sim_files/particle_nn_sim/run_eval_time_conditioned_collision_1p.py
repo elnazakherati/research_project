@@ -139,6 +139,21 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="Override rollout steps. -1 uses training steps from checkpoint config.",
     )
+    p.add_argument(
+        "--chunk-steps",
+        type=int,
+        default=0,
+        help=(
+            "If > 0 with --num-chunks > 0, run chunked autoregressive TCNO rollout: "
+            "predict chunk-steps, re-seed with last predicted state, repeat."
+        ),
+    )
+    p.add_argument(
+        "--num-chunks",
+        type=int,
+        default=0,
+        help="Number of chunks for chunked autoregressive rollout.",
+    )
     p.add_argument("--divergence-threshold", type=float, default=0.3)
     p.add_argument("--event-prob-threshold", type=float, default=0.5)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
@@ -163,6 +178,10 @@ def main() -> None:
         raise ValueError("--frame-stride must be >= 1")
     if args.divergence_threshold < 0.0:
         raise ValueError("--divergence-threshold must be >= 0")
+    if args.chunk_steps < 0:
+        raise ValueError("--chunk-steps must be >= 0")
+    if args.num_chunks < 0:
+        raise ValueError("--num-chunks must be >= 0")
 
     ckpt_path = Path(args.ckpt)
     out_dir = Path(args.out_dir)
@@ -256,7 +275,13 @@ def main() -> None:
             f"Requested empty range: split={args.split}, start={args.start_idx}, num={args.num_episodes}"
         )
 
+    chunk_mode = args.chunk_steps > 0 and args.num_chunks > 0
+    if (args.chunk_steps > 0) ^ (args.num_chunks > 0):
+        raise ValueError("Provide both --chunk-steps and --num-chunks (or leave both as 0).")
     rollout_steps = int(data_cfg["steps"]) if args.rollout_steps < 0 else int(args.rollout_steps)
+    if chunk_mode:
+        rollout_steps = int(args.chunk_steps) * int(args.num_chunks)
+
     dt = float(meta["dt"])
     radius = float(np.asarray(meta["radii"], dtype=np.float32)[0])
     W = float(meta["W"])
@@ -302,37 +327,90 @@ def main() -> None:
             wall_mode=wall_mode,
         )
         sim_true.reset(pos0, vel0)
-        pos_true, vel_true = sim_true.rollout(dt=dt, steps=rollout_steps)
+        # Chunked mode predicts states at t=dt..t=chunk_steps*dt for each chunk,
+        # so we align against GT[1:] from a rollout of (rollout_steps + 1).
+        true_steps = int(rollout_steps + 1) if chunk_mode else int(rollout_steps)
+        pos_true, vel_true = sim_true.rollout(dt=dt, steps=true_steps)
         pos_true = pos_true.astype(np.float32)
         vel_true = vel_true.astype(np.float32)
-        T = pos_true.shape[0]
-
         s0 = np.concatenate([pos_true[0, 0], vel_true[0, 0]], axis=0).astype(np.float32)
-        s0_batch = np.repeat(s0[None, :], T, axis=0).astype(np.float32)
-        if s0_mean is not None and s0_std is not None:
-            s0_batch = ((s0_batch - s0_mean) / s0_std).astype(np.float32)
-        t_query = (np.arange(T, dtype=np.float32) * dt).astype(np.float32)
 
-        with torch.no_grad():
-            s0_t = torch.from_numpy(s0_batch).to(device)
-            tq_t = torch.from_numpy(t_query).to(device)
-            out = model(s0_t, tq_t)
-            pred_state = out["state"].cpu().numpy().astype(np.float32)
-            if y_mean is not None and y_std is not None:
-                pred_state = (pred_state * y_std + y_mean).astype(np.float32)
-            evt_logit_np = out["event_logit"].squeeze(1).cpu().numpy().astype(np.float32)
-            gate_np = out["gate"].squeeze(1).cpu().numpy().astype(np.float32)
-            v_pre_np = out["v_pre"].cpu().numpy().astype(np.float32)
-            v_post_np = out["v_post"].cpu().numpy().astype(np.float32)
-            if y_mean is not None and y_std is not None:
-                # v_pre/v_post are model-space values; map velocity dims back to data-space.
-                vel_mean = y_mean[:, 2:]
-                vel_std = y_std[:, 2:]
-                v_pre_np = (v_pre_np * vel_std + vel_mean).astype(np.float32)
-                v_post_np = (v_post_np * vel_std + vel_mean).astype(np.float32)
+        if chunk_mode:
+            pred_chunks: list[np.ndarray] = []
+            logit_chunks: list[np.ndarray] = []
+            gate_chunks: list[np.ndarray] = []
+            vpre_chunks: list[np.ndarray] = []
+            vpost_chunks: list[np.ndarray] = []
+            s0_chunk = s0.copy()
+            t_query = (np.arange(1, int(args.chunk_steps) + 1, dtype=np.float32) * dt).astype(np.float32)
 
-        true_state = np.concatenate([pos_true[:, 0, :], vel_true[:, 0, :]], axis=1).astype(np.float32)
-        coll_steps = extract_collision_steps(coll_all[e], vel_true)
+            with torch.no_grad():
+                for _ in range(int(args.num_chunks)):
+                    s0_batch = np.repeat(s0_chunk[None, :], int(args.chunk_steps), axis=0).astype(np.float32)
+                    if s0_mean is not None and s0_std is not None:
+                        s0_batch = ((s0_batch - s0_mean) / s0_std).astype(np.float32)
+                    s0_t = torch.from_numpy(s0_batch).to(device)
+                    tq_t = torch.from_numpy(t_query).to(device)
+                    out = model(s0_t, tq_t)
+
+                    pred_state_chunk = out["state"].cpu().numpy().astype(np.float32)
+                    if y_mean is not None and y_std is not None:
+                        pred_state_chunk = (pred_state_chunk * y_std + y_mean).astype(np.float32)
+                    pred_chunks.append(pred_state_chunk)
+
+                    logit_chunks.append(out["event_logit"].squeeze(1).cpu().numpy().astype(np.float32))
+                    gate_chunks.append(out["gate"].squeeze(1).cpu().numpy().astype(np.float32))
+
+                    v_pre_chunk = out["v_pre"].cpu().numpy().astype(np.float32)
+                    v_post_chunk = out["v_post"].cpu().numpy().astype(np.float32)
+                    if y_mean is not None and y_std is not None:
+                        vel_mean = y_mean[:, 2:]
+                        vel_std = y_std[:, 2:]
+                        v_pre_chunk = (v_pre_chunk * vel_std + vel_mean).astype(np.float32)
+                        v_post_chunk = (v_post_chunk * vel_std + vel_mean).astype(np.float32)
+                    vpre_chunks.append(v_pre_chunk)
+                    vpost_chunks.append(v_post_chunk)
+
+                    # Re-seed next chunk with last predicted state.
+                    s0_chunk = pred_state_chunk[-1].copy()
+
+            pred_state = np.concatenate(pred_chunks, axis=0)
+            evt_logit_np = np.concatenate(logit_chunks, axis=0)
+            gate_np = np.concatenate(gate_chunks, axis=0)
+            v_pre_np = np.concatenate(vpre_chunks, axis=0)
+            v_post_np = np.concatenate(vpost_chunks, axis=0)
+            true_state_full = np.concatenate([pos_true[:, 0, :], vel_true[:, 0, :]], axis=1).astype(np.float32)
+            true_state = true_state_full[1 : 1 + pred_state.shape[0]]
+        else:
+            T = pos_true.shape[0]
+            s0_batch = np.repeat(s0[None, :], T, axis=0).astype(np.float32)
+            if s0_mean is not None and s0_std is not None:
+                s0_batch = ((s0_batch - s0_mean) / s0_std).astype(np.float32)
+            t_query = (np.arange(T, dtype=np.float32) * dt).astype(np.float32)
+
+            with torch.no_grad():
+                s0_t = torch.from_numpy(s0_batch).to(device)
+                tq_t = torch.from_numpy(t_query).to(device)
+                out = model(s0_t, tq_t)
+                pred_state = out["state"].cpu().numpy().astype(np.float32)
+                if y_mean is not None and y_std is not None:
+                    pred_state = (pred_state * y_std + y_mean).astype(np.float32)
+                evt_logit_np = out["event_logit"].squeeze(1).cpu().numpy().astype(np.float32)
+                gate_np = out["gate"].squeeze(1).cpu().numpy().astype(np.float32)
+                v_pre_np = out["v_pre"].cpu().numpy().astype(np.float32)
+                v_post_np = out["v_post"].cpu().numpy().astype(np.float32)
+                if y_mean is not None and y_std is not None:
+                    # v_pre/v_post are model-space values; map velocity dims back to data-space.
+                    vel_mean = y_mean[:, 2:]
+                    vel_std = y_std[:, 2:]
+                    v_pre_np = (v_pre_np * vel_std + vel_mean).astype(np.float32)
+                    v_post_np = (v_post_np * vel_std + vel_mean).astype(np.float32)
+            true_state = np.concatenate([pos_true[:, 0, :], vel_true[:, 0, :]], axis=1).astype(np.float32)
+
+        T = pred_state.shape[0]
+        coll_steps_full = extract_collision_steps(coll_all[e], vel_true)
+        coll_steps = coll_steps_full - (1 if chunk_mode else 0)
+        coll_steps = coll_steps[(coll_steps >= 0) & (coll_steps < T)]
         evt_true = build_event_targets(
             T=T,
             collision_steps=coll_steps,
@@ -521,6 +599,9 @@ def main() -> None:
         "split": args.split,
         "num_episodes": int(len(rows)),
         "rollout_steps": int(rollout_steps),
+        "chunk_mode": bool(chunk_mode),
+        "chunk_steps": int(args.chunk_steps),
+        "num_chunks": int(args.num_chunks),
         "divergence_threshold": float(args.divergence_threshold),
         "ttf_median": float(np.median(div_steps)),
         "ttf_p10": float(np.percentile(div_steps, 10)),
