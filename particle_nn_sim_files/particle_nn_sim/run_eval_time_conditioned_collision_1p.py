@@ -154,6 +154,17 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Number of chunks for chunked autoregressive rollout.",
     )
+    p.add_argument(
+        "--chunk-anchor-mode",
+        type=str,
+        default="pred",
+        choices=["pred", "gt"],
+        help=(
+            "Chunk re-anchoring mode when chunk rollout is enabled: "
+            "'pred' = next chunk starts from previous chunk's last prediction, "
+            "'gt' = next chunk starts from GT state at the chunk boundary."
+        ),
+    )
     p.add_argument("--divergence-threshold", type=float, default=0.3)
     p.add_argument("--event-prob-threshold", type=float, default=0.5)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
@@ -344,8 +355,10 @@ def main() -> None:
             s0_chunk = s0.copy()
             t_query = (np.arange(1, int(args.chunk_steps) + 1, dtype=np.float32) * dt).astype(np.float32)
 
+            true_state_full = np.concatenate([pos_true[:, 0, :], vel_true[:, 0, :]], axis=1).astype(np.float32)
+
             with torch.no_grad():
-                for _ in range(int(args.num_chunks)):
+                for chunk_idx in range(int(args.num_chunks)):
                     s0_batch = np.repeat(s0_chunk[None, :], int(args.chunk_steps), axis=0).astype(np.float32)
                     if s0_mean is not None and s0_std is not None:
                         s0_batch = ((s0_batch - s0_mean) / s0_std).astype(np.float32)
@@ -371,15 +384,19 @@ def main() -> None:
                     vpre_chunks.append(v_pre_chunk)
                     vpost_chunks.append(v_post_chunk)
 
-                    # Re-seed next chunk with last predicted state.
-                    s0_chunk = pred_state_chunk[-1].copy()
+                    # Re-seed next chunk using requested anchor mode.
+                    if args.chunk_anchor_mode == "gt":
+                        # Boundary after this chunk in the full GT trajectory.
+                        gt_idx = min((chunk_idx + 1) * int(args.chunk_steps), true_state_full.shape[0] - 1)
+                        s0_chunk = true_state_full[gt_idx].copy()
+                    else:
+                        s0_chunk = pred_state_chunk[-1].copy()
 
             pred_state = np.concatenate(pred_chunks, axis=0)
             evt_logit_np = np.concatenate(logit_chunks, axis=0)
             gate_np = np.concatenate(gate_chunks, axis=0)
             v_pre_np = np.concatenate(vpre_chunks, axis=0)
             v_post_np = np.concatenate(vpost_chunks, axis=0)
-            true_state_full = np.concatenate([pos_true[:, 0, :], vel_true[:, 0, :]], axis=1).astype(np.float32)
             true_state = true_state_full[1 : 1 + pred_state.shape[0]]
         else:
             T = pos_true.shape[0]
@@ -602,6 +619,7 @@ def main() -> None:
         "chunk_mode": bool(chunk_mode),
         "chunk_steps": int(args.chunk_steps),
         "num_chunks": int(args.num_chunks),
+        "chunk_anchor_mode": str(args.chunk_anchor_mode),
         "divergence_threshold": float(args.divergence_threshold),
         "ttf_median": float(np.median(div_steps)),
         "ttf_p10": float(np.percentile(div_steps, 10)),
