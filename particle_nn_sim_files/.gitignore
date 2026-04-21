@@ -14,3 +14,5 @@ wandb/
 # Keep hand-written JSON files tracked by default.
 # If you also want to ignore generated json metrics, uncomment:
 # *.json
+__pycache__/
+*.pyc
