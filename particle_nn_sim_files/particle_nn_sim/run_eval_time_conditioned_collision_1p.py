@@ -158,11 +158,12 @@ def parse_args() -> argparse.Namespace:
         "--chunk-anchor-mode",
         type=str,
         default="pred",
-        choices=["pred", "gt"],
+        choices=["pred", "gt", "nnref"],
         help=(
             "Chunk re-anchoring mode when chunk rollout is enabled: "
             "'pred' = next chunk starts from previous chunk's last prediction, "
-            "'gt' = next chunk starts from GT state at the chunk boundary."
+            "'gt' = next chunk starts from GT state at the chunk boundary, "
+            "'nnref' = GT is re-simulated from NN boundary state at each chunk."
         ),
     )
     p.add_argument("--divergence-threshold", type=float, default=0.3)
@@ -338,8 +339,9 @@ def main() -> None:
             wall_mode=wall_mode,
         )
         sim_true.reset(pos0, vel0)
-        # Chunked mode predicts states at t=dt..t=chunk_steps*dt for each chunk,
-        # so we align against GT[1:] from a rollout of (rollout_steps + 1).
+        # Chunked mode predicts states at t=dt..t=chunk_steps*dt for each chunk.
+        # For pred/gt anchors, we align against GT[1:] from a rollout of (rollout_steps + 1).
+        # For nnref, GT is re-simulated chunk-by-chunk from NN boundary states.
         true_steps = int(rollout_steps + 1) if chunk_mode else int(rollout_steps)
         pos_true, vel_true = sim_true.rollout(dt=dt, steps=true_steps)
         pos_true = pos_true.astype(np.float32)
@@ -356,6 +358,7 @@ def main() -> None:
             t_query = (np.arange(1, int(args.chunk_steps) + 1, dtype=np.float32) * dt).astype(np.float32)
 
             true_state_full = np.concatenate([pos_true[:, 0, :], vel_true[:, 0, :]], axis=1).astype(np.float32)
+            true_chunks: list[np.ndarray] = []
 
             with torch.no_grad():
                 for chunk_idx in range(int(args.num_chunks)):
@@ -397,7 +400,27 @@ def main() -> None:
             gate_np = np.concatenate(gate_chunks, axis=0)
             v_pre_np = np.concatenate(vpre_chunks, axis=0)
             v_post_np = np.concatenate(vpost_chunks, axis=0)
-            true_state = true_state_full[1 : 1 + pred_state.shape[0]]
+            if args.chunk_anchor_mode == "nnref":
+                # Re-simulate GT chunk-by-chunk from NN boundary states.
+                s0_ref = s0.copy()
+                for chunk_idx in range(int(args.num_chunks)):
+                    sim_ref = ParticleSim2D(
+                        W=W,
+                        H=H,
+                        radii=[radius],
+                        masses=[mass],
+                        restitution=restitution,
+                        seed=20_000 + e * 100 + chunk_idx,
+                        wall_mode=wall_mode,
+                    )
+                    sim_ref.reset(s0_ref[:2].reshape(1, 2), s0_ref[2:].reshape(1, 2))
+                    pos_ref, vel_ref = sim_ref.rollout(dt=dt, steps=int(args.chunk_steps + 1))
+                    true_chunk = np.concatenate([pos_ref[1:, 0, :], vel_ref[1:, 0, :]], axis=1).astype(np.float32)
+                    true_chunks.append(true_chunk)
+                    s0_ref = pred_chunks[chunk_idx][-1].copy()
+                true_state = np.concatenate(true_chunks, axis=0)
+            else:
+                true_state = true_state_full[1 : 1 + pred_state.shape[0]]
         else:
             T = pos_true.shape[0]
             s0_batch = np.repeat(s0[None, :], T, axis=0).astype(np.float32)
@@ -425,11 +448,17 @@ def main() -> None:
             true_state = np.concatenate([pos_true[:, 0, :], vel_true[:, 0, :]], axis=1).astype(np.float32)
 
         T = pred_state.shape[0]
-        # In chunked long-horizon eval, coll_all[e] may only cover the original
-        # dataset episode length, so infer collisions from the full GT rollout.
-        coll_steps_full = infer_collision_steps_from_velocity(vel_true)
-        coll_steps = coll_steps_full - (1 if chunk_mode else 0)
-        coll_steps = coll_steps[(coll_steps >= 0) & (coll_steps < T)]
+        if chunk_mode and args.chunk_anchor_mode == "nnref":
+            coll_steps = infer_collision_steps_from_velocity(
+                true_state[:, 2:].reshape(T, 1, 2).astype(np.float32)
+            )
+            coll_steps = coll_steps[(coll_steps >= 0) & (coll_steps < T)]
+        else:
+            # In chunked long-horizon eval, coll_all[e] may only cover the original
+            # dataset episode length, so infer collisions from the full GT rollout.
+            coll_steps_full = infer_collision_steps_from_velocity(vel_true)
+            coll_steps = coll_steps_full - (1 if chunk_mode else 0)
+            coll_steps = coll_steps[(coll_steps >= 0) & (coll_steps < T)]
         evt_true = build_event_targets(
             T=T,
             collision_steps=coll_steps,
