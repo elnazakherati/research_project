@@ -425,7 +425,9 @@ def main() -> None:
             true_state = np.concatenate([pos_true[:, 0, :], vel_true[:, 0, :]], axis=1).astype(np.float32)
 
         T = pred_state.shape[0]
-        coll_steps_full = extract_collision_steps(coll_all[e], vel_true)
+        # In chunked long-horizon eval, coll_all[e] may only cover the original
+        # dataset episode length, so infer collisions from the full GT rollout.
+        coll_steps_full = infer_collision_steps_from_velocity(vel_true)
         coll_steps = coll_steps_full - (1 if chunk_mode else 0)
         coll_steps = coll_steps[(coll_steps >= 0) & (coll_steps < T)]
         evt_true = build_event_targets(
