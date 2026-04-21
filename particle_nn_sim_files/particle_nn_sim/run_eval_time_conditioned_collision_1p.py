@@ -414,7 +414,10 @@ def main() -> None:
                         wall_mode=wall_mode,
                     )
                     sim_ref.reset(s0_ref[:2].reshape(1, 2), s0_ref[2:].reshape(1, 2))
-                    pos_ref, vel_ref = sim_ref.rollout(dt=dt, steps=int(args.chunk_steps + 1))
+                    # ParticleSim2D.rollout returns steps+1 states including t=0.
+                    # To get exactly `chunk_steps` targets after dropping t=0,
+                    # request `steps=chunk_steps`.
+                    pos_ref, vel_ref = sim_ref.rollout(dt=dt, steps=int(args.chunk_steps))
                     true_chunk = np.concatenate([pos_ref[1:, 0, :], vel_ref[1:, 0, :]], axis=1).astype(np.float32)
                     true_chunks.append(true_chunk)
                     s0_ref = pred_chunks[chunk_idx][-1].copy()
