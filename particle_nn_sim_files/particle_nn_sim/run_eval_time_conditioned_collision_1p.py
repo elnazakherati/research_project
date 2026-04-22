@@ -125,6 +125,21 @@ def compute_sign_accuracy(pred_vel: np.ndarray, true_vel: np.ndarray, sign_epsil
     return {"sign_acc_vx": acc_x, "sign_acc_vy": acc_y}
 
 
+def renormalize_velocity_in_state(state: np.ndarray, target_speed: float, eps: float = 1e-12) -> np.ndarray:
+    """Return a copy of [x,y,vx,vy] with velocity magnitude set to target_speed."""
+    out = state.copy()
+    if target_speed <= 0.0:
+        return out
+    vx, vy = float(out[2]), float(out[3])
+    vnorm = float(np.hypot(vx, vy))
+    if vnorm <= eps:
+        return out
+    scale = float(target_speed) / vnorm
+    out[2] = np.float32(vx * scale)
+    out[3] = np.float32(vy * scale)
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Evaluate TimeConditionedCollisionModel checkpoint on train/val/test split."
@@ -175,6 +190,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fps", type=int, default=50)
     p.add_argument("--frame-stride", type=int, default=1)
     p.add_argument("--sign-epsilon", type=float, default=1e-6)
+    p.add_argument(
+        "--renorm-speed",
+        type=float,
+        default=0.0,
+        help=(
+            "If > 0, renormalize chunk boundary velocity to this magnitude "
+            "before feeding it into the next chunk."
+        ),
+    )
     p.add_argument("--plateau-event-threshold", type=float, default=0.1)
     p.add_argument("--out-dir", type=str, default="checkpoints/eval_tc_collision_1p")
     return p.parse_args()
@@ -194,6 +218,8 @@ def main() -> None:
         raise ValueError("--chunk-steps must be >= 0")
     if args.num_chunks < 0:
         raise ValueError("--num-chunks must be >= 0")
+    if args.renorm_speed < 0.0:
+        raise ValueError("--renorm-speed must be >= 0")
 
     ckpt_path = Path(args.ckpt)
     out_dir = Path(args.out_dir)
@@ -394,6 +420,8 @@ def main() -> None:
                         s0_chunk = true_state_full[gt_idx].copy()
                     else:
                         s0_chunk = pred_state_chunk[-1].copy()
+                        if args.renorm_speed > 0.0:
+                            s0_chunk = renormalize_velocity_in_state(s0_chunk, float(args.renorm_speed))
 
             pred_state = np.concatenate(pred_chunks, axis=0)
             evt_logit_np = np.concatenate(logit_chunks, axis=0)
@@ -654,6 +682,7 @@ def main() -> None:
         "chunk_steps": int(args.chunk_steps),
         "num_chunks": int(args.num_chunks),
         "chunk_anchor_mode": str(args.chunk_anchor_mode),
+        "renorm_speed": float(args.renorm_speed),
         "divergence_threshold": float(args.divergence_threshold),
         "ttf_median": float(np.median(div_steps)),
         "ttf_p10": float(np.percentile(div_steps, 10)),
