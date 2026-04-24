@@ -357,36 +357,6 @@ def build_query_samples(
     )
 
 
-def compute_event_metrics(logits: np.ndarray, labels: np.ndarray, threshold: float = 0.5) -> dict[str, float]:
-    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -60.0, 60.0)))
-    pred = probs >= float(threshold)
-    y = labels >= 0.5
-    tp = int(np.sum(pred & y))
-    fp = int(np.sum(pred & (~y)))
-    tn = int(np.sum((~pred) & (~y)))
-    fn = int(np.sum((~pred) & y))
-    acc = (tp + tn) / max(1, tp + tn + fp + fn)
-    prec = tp / max(1, tp + fp)
-    rec = tp / max(1, tp + fn)
-    return {
-        "event_accuracy": float(acc),
-        "event_precision": float(prec),
-        "event_recall": float(rec),
-    }
-
-
-def compute_sign_accuracy(pred_vel: np.ndarray, true_vel: np.ndarray, sign_epsilon: float = 1e-6) -> dict[str, float]:
-    mask_x = np.abs(true_vel[:, 0]) > float(sign_epsilon)
-    mask_y = np.abs(true_vel[:, 1]) > float(sign_epsilon)
-    pred_x = pred_vel[:, 0] >= 0.0
-    pred_y = pred_vel[:, 1] >= 0.0
-    true_x = true_vel[:, 0] >= 0.0
-    true_y = true_vel[:, 1] >= 0.0
-    acc_x = float(np.mean(pred_x[mask_x] == true_x[mask_x])) if np.any(mask_x) else 1.0
-    acc_y = float(np.mean(pred_y[mask_y] == true_y[mask_y])) if np.any(mask_y) else 1.0
-    return {"sign_acc_vx": acc_x, "sign_acc_vy": acc_y}
-
-
 def velocity_sign_loss(pred_vel: Tensor, true_vel: Tensor, sign_epsilon: float = 1e-6) -> Tensor:
     mask = torch.abs(true_vel) > float(sign_epsilon)
     if not torch.any(mask):
@@ -402,14 +372,11 @@ def evaluate(
     loader: DataLoader,
     device: str,
     state_std: Standardizer | None,
-    event_threshold: float = 0.5,
-    sign_epsilon: float = 1e-6,
     plateau_event_threshold: float = 0.1,
 ) -> dict[str, float]:
     model.eval()
     state_preds: list[np.ndarray] = []
     state_targets: list[np.ndarray] = []
-    event_logits: list[np.ndarray] = []
     event_targets: list[np.ndarray] = []
 
     for s0, t_q, y_state, y_event in loader:
@@ -419,10 +386,8 @@ def evaluate(
         y_event = y_event.to(device)
         out = model(s0, t_q)
         pred_state = out["state"]
-        logit = out["event_logit"]
         state_preds.append(pred_state.cpu().numpy())
         state_targets.append(y_state.cpu().numpy())
-        event_logits.append(logit.squeeze(1).cpu().numpy())
         event_targets.append(y_event.cpu().numpy())
 
     pred_s = np.concatenate(state_preds, axis=0).astype(np.float32)
@@ -431,14 +396,11 @@ def evaluate(
         pred_s = state_std.inverse(pred_s)
         true_s = state_std.inverse(true_s)
 
-    logits = np.concatenate(event_logits, axis=0).astype(np.float32)
     y_evt = np.concatenate(event_targets, axis=0).astype(np.float32)
 
     pos_mse = float(np.mean((pred_s[:, :2] - true_s[:, :2]) ** 2))
     vel_mse = float(np.mean((pred_s[:, 2:] - true_s[:, 2:]) ** 2))
     state_mse = float(np.mean((pred_s - true_s) ** 2))
-    evt = compute_event_metrics(logits=logits, labels=y_evt, threshold=event_threshold)
-    sign_metrics = compute_sign_accuracy(pred_s[:, 2:], true_s[:, 2:], sign_epsilon=sign_epsilon)
     free_mask = y_evt < float(plateau_event_threshold)
     plateau_vel_mse = (
         float(np.mean((pred_s[free_mask, 2:] - true_s[free_mask, 2:]) ** 2))
@@ -450,8 +412,6 @@ def evaluate(
         "position_mse": pos_mse,
         "velocity_mse": vel_mse,
         "plateau_velocity_mse": plateau_vel_mse,
-        **evt,
-        **sign_metrics,
     }
 
 
@@ -485,11 +445,9 @@ def plot_state_and_event_over_time(
     pred_state: np.ndarray,
     event_prob: np.ndarray,
     event_target: np.ndarray,
-    gate: np.ndarray | None,
     out_path: Path,
 ) -> None:
-    n_rows = 7 if gate is not None else 6
-    fig, axs = plt.subplots(n_rows, 1, figsize=(10, 15 if gate is not None else 13), sharex=True)
+    fig, axs = plt.subplots(6, 1, figsize=(10, 13), sharex=True)
     labels = ["x(t)", "y(t)", "vx(t)", "vy(t)"]
     for i in range(4):
         axs[i].plot(t_query, true_state[:, i], lw=2, label="true")
@@ -512,16 +470,7 @@ def plot_state_and_event_over_time(
     evt_ax.set_ylim([-0.05, 1.05])
     evt_ax.grid(True, alpha=0.3)
     evt_ax.legend(loc="best")
-    if gate is not None:
-        gate_ax = axs[6]
-        gate_ax.plot(t_query, gate, lw=2, label="gate(t)")
-        gate_ax.set_ylabel("gate")
-        gate_ax.set_xlabel("time (s)")
-        gate_ax.set_ylim([-0.05, 1.05])
-        gate_ax.grid(True, alpha=0.3)
-        gate_ax.legend(loc="best")
-    else:
-        evt_ax.set_xlabel("time (s)")
+    evt_ax.set_xlabel("time (s)")
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -574,12 +523,10 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-raw-time", type=str2bool, default=True)
     p.add_argument("--normalize-time", type=str2bool, default=True)
     p.add_argument("--time-max", type=float, default=-1.0)
-    p.add_argument("--model-variant", type=str, default="simple_tcno", choices=["simple_tcno", "gated_tcno"])
     p.add_argument("--trunk-width", type=int, default=256)
     p.add_argument("--trunk-depth", type=int, default=3)
     p.add_argument("--activation", type=str, default="gelu", choices=["gelu", "silu"])
     p.add_argument("--dropout", type=float, default=0.0)
-    p.add_argument("--alpha-gate", type=float, default=5.0)
 
     # Loss.
     p.add_argument("--lambda-pos", type=float, default=1.0)
@@ -727,9 +674,7 @@ def main() -> None:
         trunk_depth=args.trunk_depth,
         activation=args.activation,
         dropout=args.dropout,
-        model_variant=args.model_variant,
-        alpha_gate=args.alpha_gate,
-        enforce_t0_anchor=(args.model_variant == "simple_tcno"),
+        enforce_t0_anchor=True,
         time_encoding=TimeEncodingConfig(
             mode=args.time_encoding_mode,
             num_frequencies=args.num_frequencies,
@@ -750,8 +695,6 @@ def main() -> None:
                 "trunk_depth": model_cfg.trunk_depth,
                 "activation": model_cfg.activation,
                 "dropout": model_cfg.dropout,
-                "model_variant": model_cfg.model_variant,
-                "alpha_gate": model_cfg.alpha_gate,
                 "enforce_t0_anchor": model_cfg.enforce_t0_anchor,
                 "time_encoding_mode": model_cfg.time_encoding.mode,
                 "base_frequency": model_cfg.time_encoding.base_frequency,
@@ -786,8 +729,6 @@ def main() -> None:
                     "trunk_depth": model_cfg.trunk_depth,
                     "activation": model_cfg.activation,
                     "dropout": model_cfg.dropout,
-                    "model_variant": model_cfg.model_variant,
-                    "alpha_gate": model_cfg.alpha_gate,
                     "enforce_t0_anchor": model_cfg.enforce_t0_anchor,
                     "time_encoding_mode": model_cfg.time_encoding.mode,
                     "base_frequency": model_cfg.time_encoding.base_frequency,
@@ -963,15 +904,19 @@ def main() -> None:
         "val_position_mse": [],
         "val_velocity_mse": [],
         "val_plateau_velocity_mse": [],
-        "val_event_accuracy": [],
-        "train_t0_anchor_err": [],
-        "val_t0_anchor_err": [],
-        "test_t0_anchor_err": [],
-        "lr": [],
     }
     best = {"epoch": -1, "val_state_mse": float("inf"), "state_dict": None}
 
     # Training loop.
+    train_t0_err = evaluate_t0_anchor_error(model=model, loader=train_loader, device=device)
+    val_t0_err = evaluate_t0_anchor_error(model=model, loader=val_loader, device=device)
+    test_t0_err = evaluate_t0_anchor_error(model=model, loader=test_loader, device=device)
+    print(
+        "t0_anchor_err (query t=0) | "
+        f"train={train_t0_err:.3e} val={val_t0_err:.3e} test={test_t0_err:.3e}"
+    )
+
+    prev_lr: float | None = None
     for ep in range(1, train_cfg.epochs + 1):
         lr_now = float(opt.param_groups[0]["lr"])
         model.train()
@@ -1036,8 +981,6 @@ def main() -> None:
             loader=val_loader,
             device=device,
             state_std=y_std,
-            event_threshold=run_cfg.event_prob_threshold,
-            sign_epsilon=run_cfg.sign_epsilon,
             plateau_event_threshold=train_cfg.plateau_event_threshold,
         )
         test_metrics = evaluate(
@@ -1045,8 +988,6 @@ def main() -> None:
             loader=test_loader,
             device=device,
             state_std=y_std,
-            event_threshold=run_cfg.event_prob_threshold,
-            sign_epsilon=run_cfg.sign_epsilon,
             plateau_event_threshold=train_cfg.plateau_event_threshold,
         )
 
@@ -1060,14 +1001,6 @@ def main() -> None:
         history["val_position_mse"].append(val_metrics["position_mse"])
         history["val_velocity_mse"].append(val_metrics["velocity_mse"])
         history["val_plateau_velocity_mse"].append(val_metrics["plateau_velocity_mse"])
-        history["val_event_accuracy"].append(val_metrics["event_accuracy"])
-        train_t0_err = evaluate_t0_anchor_error(model=model, loader=train_loader, device=device)
-        val_t0_err = evaluate_t0_anchor_error(model=model, loader=val_loader, device=device)
-        test_t0_err = evaluate_t0_anchor_error(model=model, loader=test_loader, device=device)
-        history["train_t0_anchor_err"].append(train_t0_err)
-        history["val_t0_anchor_err"].append(val_t0_err)
-        history["test_t0_anchor_err"].append(test_t0_err)
-        history["lr"].append(lr_now)
 
         if val_metrics["state_mse"] < best["val_state_mse"]:
             best["val_state_mse"] = val_metrics["state_mse"]
@@ -1088,50 +1021,35 @@ def main() -> None:
                     "val_position_mse": val_metrics["position_mse"],
                     "val_velocity_mse": val_metrics["velocity_mse"],
                     "val_plateau_velocity_mse": val_metrics["plateau_velocity_mse"],
-                    "val_event_accuracy": val_metrics["event_accuracy"],
-                    "val_event_precision": val_metrics["event_precision"],
-                    "val_event_recall": val_metrics["event_recall"],
-                    "val_sign_acc_vx": val_metrics["sign_acc_vx"],
-                    "val_sign_acc_vy": val_metrics["sign_acc_vy"],
-                    "train_t0_anchor_err": train_t0_err,
-                    "val_t0_anchor_err": val_t0_err,
-                    "test_t0_anchor_err": test_t0_err,
                     "lr": lr_now,
                     "test_state_mse": test_metrics["state_mse"],
                     "test_position_mse": test_metrics["position_mse"],
                     "test_velocity_mse": test_metrics["velocity_mse"],
                     "test_plateau_velocity_mse": test_metrics["plateau_velocity_mse"],
-                    "test_event_accuracy": test_metrics["event_accuracy"],
-                    "test_event_precision": test_metrics["event_precision"],
-                    "test_event_recall": test_metrics["event_recall"],
-                    "test_sign_acc_vx": test_metrics["sign_acc_vx"],
-                    "test_sign_acc_vy": test_metrics["sign_acc_vy"],
                     "best_val_state_mse_so_far": best["val_state_mse"],
                     "best_epoch_so_far": best["epoch"],
                 }
             )
 
+        lr_note = f" | lr={lr_now:.6g}" if prev_lr is None or abs(lr_now - prev_lr) > 0.0 else ""
         print(
-            f"Epoch {ep:04d} | lr={lr_now:.6g} | train_total={train_total:.6f} pos={train_pos:.6f} vel={train_vel:.6f} evt={train_evt:.6f} sign={train_sign:.6f} flat={train_flat:.6f} "
-            f"| val_state={val_metrics['state_mse']:.6f} val_evt_acc={val_metrics['event_accuracy']:.4f} val_t0={val_t0_err:.3e} "
-            f"| test_state={test_metrics['state_mse']:.6f} test_evt_acc={test_metrics['event_accuracy']:.4f} "
+            f"Epoch {ep:04d} | train_total={train_total:.6f} pos={train_pos:.6f} vel={train_vel:.6f} evt={train_evt:.6f} sign={train_sign:.6f} flat={train_flat:.6f} "
+            f"| val_state={val_metrics['state_mse']:.6f} "
+            f"| test_state={test_metrics['state_mse']:.6f} "
             f"| best_epoch={best['epoch']}"
         )
+        if lr_note:
+            print(f"  learning_rate_update{lr_note}")
+        prev_lr = lr_now
         scheduler.step()
 
     if best["state_dict"] is not None:
         model.load_state_dict(best["state_dict"])
 
     # Final metrics using best-by-val model.
-    final_train = evaluate(
-        model, train_loader, device, y_std, run_cfg.event_prob_threshold, run_cfg.sign_epsilon, train_cfg.plateau_event_threshold
-    )
-    final_val = evaluate(
-        model, val_loader, device, y_std, run_cfg.event_prob_threshold, run_cfg.sign_epsilon, train_cfg.plateau_event_threshold
-    )
-    final_test = evaluate(
-        model, test_loader, device, y_std, run_cfg.event_prob_threshold, run_cfg.sign_epsilon, train_cfg.plateau_event_threshold
-    )
+    final_train = evaluate(model, train_loader, device, y_std, train_cfg.plateau_event_threshold)
+    final_val = evaluate(model, val_loader, device, y_std, train_cfg.plateau_event_threshold)
+    final_test = evaluate(model, test_loader, device, y_std, train_cfg.plateau_event_threshold)
 
     # Visualization for one test episode.
     plot_ep_local = int(np.clip(run_cfg.plot_episode_idx, 0, len(test_eps) - 1))
@@ -1167,17 +1085,12 @@ def main() -> None:
         if y_std is not None:
             pred_state = y_std.inverse(pred_state)
         evt_prob = torch.sigmoid(out["event_logit"].squeeze(1)).cpu().numpy().astype(np.float32)
-        gate_np = None
-        if model_cfg.model_variant == "gated_tcno":
-            gate_np = out["gate"].squeeze(1).cpu().numpy().astype(np.float32)
-
     plot_state_and_event_over_time(
         t_query=t_q,
         true_state=true_state,
         pred_state=pred_state,
         event_prob=evt_prob,
         event_target=evt_true,
-        gate=gate_np,
         out_path=out_dir / "state_and_event_vs_time.png",
     )
 
@@ -1218,8 +1131,6 @@ def main() -> None:
                 "trunk_depth": model_cfg.trunk_depth,
                 "activation": model_cfg.activation,
                 "dropout": model_cfg.dropout,
-                "model_variant": model_cfg.model_variant,
-                "alpha_gate": model_cfg.alpha_gate,
                 "enforce_t0_anchor": model_cfg.enforce_t0_anchor,
                 "time_encoding_mode": model_cfg.time_encoding.mode,
                 "base_frequency": model_cfg.time_encoding.base_frequency,
@@ -1241,8 +1152,6 @@ def main() -> None:
             "trunk_depth": model_cfg.trunk_depth,
             "activation": model_cfg.activation,
             "dropout": model_cfg.dropout,
-            "model_variant": model_cfg.model_variant,
-            "alpha_gate": model_cfg.alpha_gate,
             "enforce_t0_anchor": model_cfg.enforce_t0_anchor,
             "time_encoding_mode": model_cfg.time_encoding.mode,
             "base_frequency": model_cfg.time_encoding.base_frequency,
@@ -1278,12 +1187,9 @@ def main() -> None:
         wandb_run.summary["final_test_position_mse"] = final_test["position_mse"]
         wandb_run.summary["final_test_velocity_mse"] = final_test["velocity_mse"]
         wandb_run.summary["final_test_plateau_velocity_mse"] = final_test["plateau_velocity_mse"]
-        wandb_run.summary["final_test_event_accuracy"] = final_test["event_accuracy"]
-        wandb_run.summary["final_test_event_precision"] = final_test["event_precision"]
-        wandb_run.summary["final_test_event_recall"] = final_test["event_recall"]
-        wandb_run.summary["final_train_t0_anchor_err"] = history["train_t0_anchor_err"][-1] if history["train_t0_anchor_err"] else 0.0
-        wandb_run.summary["final_val_t0_anchor_err"] = history["val_t0_anchor_err"][-1] if history["val_t0_anchor_err"] else 0.0
-        wandb_run.summary["final_test_t0_anchor_err"] = history["test_t0_anchor_err"][-1] if history["test_t0_anchor_err"] else 0.0
+        wandb_run.summary["final_train_t0_anchor_err"] = train_t0_err
+        wandb_run.summary["final_val_t0_anchor_err"] = val_t0_err
+        wandb_run.summary["final_test_t0_anchor_err"] = test_t0_err
         wandb_run.finish()
 
     print("Run complete.")

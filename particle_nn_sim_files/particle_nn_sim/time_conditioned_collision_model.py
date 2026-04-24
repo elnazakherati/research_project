@@ -88,8 +88,6 @@ class TimeConditionedCollisionModelConfig:
     trunk_depth: int = 3
     activation: str = "gelu"  # {"gelu", "silu"}
     dropout: float = 0.0
-    model_variant: str = "simple_tcno"  # {"simple_tcno", "gated_tcno"}
-    alpha_gate: float = 5.0
     enforce_t0_anchor: bool = True
     time_encoding: TimeEncodingConfig = field(default_factory=TimeEncodingConfig)
 
@@ -105,16 +103,12 @@ def _make_activation(name: str) -> nn.Module:
 
 class TimeConditionedCollisionModel(nn.Module):
     """
-    Pure-ML time-conditioned model supporting two variants:
-      simple_tcno: position + velocity + event heads (no gating)
-      gated_tcno:  position + pre/post velocity + event heads with learned gate
+    Pure-ML simple TCNO with separate position, velocity, and event heads.
     """
 
     def __init__(self, cfg: TimeConditionedCollisionModelConfig):
         super().__init__()
         self.cfg = cfg
-        if cfg.model_variant not in {"simple_tcno", "gated_tcno"}:
-            raise ValueError(f"Unsupported model_variant: {cfg.model_variant}")
         self.time_encoder = TimeEncoder(cfg.time_encoding)
 
         in_dim = cfg.state_dim + self.time_encoder.out_dim
@@ -132,14 +126,7 @@ class TimeConditionedCollisionModel(nn.Module):
         self.trunk = nn.Sequential(*trunk_layers)
 
         self.pos_head = nn.Linear(width, 2)
-        if cfg.model_variant == "gated_tcno":
-            self.vel_pre_head = nn.Linear(width, 2)
-            self.vel_post_head = nn.Linear(width, 2)
-            self.vel_head = None
-        else:
-            self.vel_head = nn.Linear(width, 2)
-            self.vel_pre_head = None
-            self.vel_post_head = None
+        self.vel_head = nn.Linear(width, 2)
         self.event_head = nn.Linear(width, 1)
 
         # Optional affine map for converting input-space s0 into output-space anchor.
@@ -180,11 +167,8 @@ class TimeConditionedCollisionModel(nn.Module):
             t:  (B,) or (B,1), queried time in seconds
         Returns dict with:
             pos: (B,2)
-            vel: (B,2) for simple_tcno
-            v_pre: (B,2)
-            v_post: (B,2)
+            vel: (B,2)
             event_logit: (B,1)
-            gate: (B,1), zeros for simple_tcno
             state: (B,4) => [x(t), y(t), vx(t), vy(t)]
         """
         if s0.ndim != 2 or s0.shape[1] != 4:
@@ -200,24 +184,9 @@ class TimeConditionedCollisionModel(nn.Module):
         x = torch.cat([s0, gamma_t], dim=1)
         h = self.trunk(x)
         pos = self.pos_head(h)
+        vel = self.vel_head(h)
         event_logit = self.event_head(h)
-
-        if self.cfg.model_variant == "gated_tcno":
-            assert self.vel_pre_head is not None and self.vel_post_head is not None
-            v_pre = self.vel_pre_head(h)
-            v_post = self.vel_post_head(h)
-            gate = torch.sigmoid(float(self.cfg.alpha_gate) * event_logit)
-            v_pred = (1.0 - gate) * v_pre + gate * v_post
-            vel = v_pred
-        else:
-            assert self.vel_head is not None
-            vel = self.vel_head(h)
-            v_pre = vel
-            v_post = vel
-            gate = torch.zeros_like(event_logit)
-            v_pred = vel
-
-        state_delta = torch.cat([pos, v_pred], dim=1)
+        state_delta = torch.cat([pos, vel], dim=1)
         if self.cfg.enforce_t0_anchor:
             # Reparameterization: s_hat(t) = s0_anchor + t * h_theta(s0, t)
             # This guarantees exact initial-state matching at t=0.
@@ -228,9 +197,6 @@ class TimeConditionedCollisionModel(nn.Module):
         return {
             "pos": pos,
             "vel": vel,
-            "v_pre": v_pre,
-            "v_post": v_post,
             "event_logit": event_logit,
-            "gate": gate,
             "state": state_pred,
         }
