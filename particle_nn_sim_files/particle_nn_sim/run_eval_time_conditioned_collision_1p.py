@@ -75,6 +75,11 @@ def build_event_targets(
         return labels
 
     mode = str(mode).strip().lower()
+    if mode == "spike":
+        valid = collision_steps[(collision_steps >= 0) & (collision_steps < T)].astype(np.int64)
+        labels[valid] = 1.0
+        return labels
+
     if mode == "window":
         win_steps = max(int(eps_steps), int(np.ceil(float(event_window) / float(dt))))
         for c in collision_steps:

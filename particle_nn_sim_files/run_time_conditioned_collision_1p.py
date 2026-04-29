@@ -226,6 +226,11 @@ def build_event_targets(
         return labels
 
     mode = str(mode).strip().lower()
+    if mode == "spike":
+        valid = collision_steps[(collision_steps >= 0) & (collision_steps < T)].astype(np.int64)
+        labels[valid] = 1.0
+        return labels
+
     if mode == "window":
         win_steps = max(int(eps_steps), int(np.ceil(float(event_window) / float(dt))))
         for c in collision_steps:
@@ -489,7 +494,7 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--mass", type=float, default=1.0)
     p.add_argument("--wall-collision-mode", type=str, default="clamp", choices=["clamp", "exact"])
     p.add_argument("--coll-epsilon-steps", type=int, default=2)
-    p.add_argument("--event-target-mode", type=str, default="gaussian", choices=["window", "gaussian"])
+    p.add_argument("--event-target-mode", type=str, default="gaussian", choices=["window", "gaussian", "spike"])
     p.add_argument("--event-window", type=float, default=0.04)
     p.add_argument("--sigma-event", type=float, default=0.02)
     p.add_argument("--use-collision-oversampling", type=str2bool, default=True)
