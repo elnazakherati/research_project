@@ -120,6 +120,16 @@ def parse_args() -> argparse.Namespace:
         description="Evaluate TimeConditionedCollisionModel checkpoint on train/val/test split."
     )
     p.add_argument("--ckpt", type=str, required=True, help="Path to model_tc_collision_1p.pt")
+    p.add_argument(
+        "--single-ic",
+        type=str2bool,
+        default=False,
+        help="If true, ignore dataset split and evaluate one user-provided initial condition.",
+    )
+    p.add_argument("--ic-x", type=float, default=None, help="Initial x in [0,1] for --single-ic mode.")
+    p.add_argument("--ic-y", type=float, default=None, help="Initial y in [0,1] for --single-ic mode.")
+    p.add_argument("--ic-vx", type=float, default=None, help="Initial vx for --single-ic mode.")
+    p.add_argument("--ic-vy", type=float, default=None, help="Initial vy for --single-ic mode.")
     p.add_argument("--split", type=str, default="test", choices=["train", "val", "test"])
     p.add_argument("--num-episodes", type=int, default=10)
     p.add_argument("--start-idx", type=int, default=0)
@@ -176,6 +186,145 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--plateau-event-threshold", type=float, default=0.1)
     p.add_argument("--out-dir", type=str, default="checkpoints/eval_tc_collision_1p")
     return p.parse_args()
+
+
+def run_single_ic_eval(
+    *,
+    model: TimeConditionedCollisionModel,
+    args: argparse.Namespace,
+    ckpt: dict[str, Any],
+    out_dir: Path,
+    dt: float,
+    W: float,
+    H: float,
+    radius: float,
+    mass: float,
+    restitution: float,
+    wall_mode: str,
+    s0_mean: np.ndarray | None,
+    s0_std: np.ndarray | None,
+    y_mean: np.ndarray | None,
+    y_std: np.ndarray | None,
+    device: str,
+) -> None:
+    if any(v is None for v in (args.ic_x, args.ic_y, args.ic_vx, args.ic_vy)):
+        raise ValueError("--single-ic requires --ic-x --ic-y --ic-vx --ic-vy.")
+
+    rollout_steps = int(ckpt["config"]["data"]["steps"]) if args.rollout_steps < 0 else int(args.rollout_steps)
+    if rollout_steps < 1:
+        raise ValueError("--rollout-steps must be >= 1 in --single-ic mode.")
+
+    s0 = np.array([args.ic_x, args.ic_y, args.ic_vx, args.ic_vy], dtype=np.float32)
+    T = int(rollout_steps + 1)  # include t=0
+    t_query = (np.arange(T, dtype=np.float32) * float(dt)).astype(np.float32)
+    s0_batch = np.repeat(s0[None, :], T, axis=0).astype(np.float32)
+    if s0_mean is not None and s0_std is not None:
+        s0_batch = ((s0_batch - s0_mean) / s0_std).astype(np.float32)
+
+    with torch.no_grad():
+        s0_t = torch.from_numpy(s0_batch).to(device)
+        tq_t = torch.from_numpy(t_query).to(device)
+        out = model(s0_t, tq_t)
+        pred_state = out["state"].cpu().numpy().astype(np.float32)
+        if y_mean is not None and y_std is not None:
+            pred_state = (pred_state * y_std + y_mean).astype(np.float32)
+        evt_logit_np = out["event_logit"].squeeze(1).cpu().numpy().astype(np.float32)
+    evt_prob = 1.0 / (1.0 + np.exp(-np.clip(evt_logit_np, -60.0, 60.0)))
+
+    # Build GT from the same IC for optional overlay/error diagnostics.
+    sim_true = ParticleSim2D(
+        W=W,
+        H=H,
+        radii=[radius],
+        masses=[mass],
+        restitution=restitution,
+        seed=123456,
+        wall_mode=wall_mode,
+    )
+    sim_true.reset(s0[:2].reshape(1, 2), s0[2:].reshape(1, 2))
+    pos_true, vel_true = sim_true.rollout(dt=dt, steps=int(rollout_steps))
+    true_state = np.concatenate([pos_true[:, 0, :], vel_true[:, 0, :]], axis=1).astype(np.float32)
+    pred_pos = pred_state[:, :2].reshape(T, 1, 2).astype(np.float32)
+    true_pos = true_state[:, :2].reshape(T, 1, 2).astype(np.float32)
+
+    final_pred = pred_state[-1].tolist()
+    final_true = true_state[-1].tolist()
+    print(
+        "Single-IC final state @ step "
+        f"{rollout_steps}: pred=[{final_pred[0]:.6f}, {final_pred[1]:.6f}, {final_pred[2]:.6f}, {final_pred[3]:.6f}] "
+        f"true=[{final_true[0]:.6f}, {final_true[1]:.6f}, {final_true[2]:.6f}, {final_true[3]:.6f}]"
+    )
+
+    # Save overlay video and compact diagnostics.
+    if not args.no_render and args.save_overlay:
+        overlay = animate_overlay_gt_perturbed_1p(
+            pos_ref=true_pos[:: args.frame_stride],
+            pos_pert=pred_pos[:: args.frame_stride],
+            radius=radius,
+            W=W,
+            H=H,
+            dt=float(dt) * float(args.frame_stride),
+            title=f"GT vs TCNO (single-ic) step={rollout_steps}",
+            label_ref="GT",
+            label_pert="TCNO",
+        )
+        save_animation_mp4(overlay, str(out_dir / "single_ic_gt_vs_pred_overlay_1p.mp4"), fps=args.fps)
+
+    fig, axs = plt.subplots(5, 1, figsize=(10, 10), sharex=True)
+    idx = np.arange(T)
+    axs[0].plot(idx, true_state[:, 0], lw=2, label="true")
+    axs[0].plot(idx, pred_state[:, 0], lw=1.8, alpha=0.9, label="pred")
+    axs[0].set_ylabel("x(t)")
+    axs[0].legend(loc="best")
+    axs[0].grid(True, alpha=0.3)
+
+    axs[1].plot(idx, true_state[:, 1], lw=2, label="true")
+    axs[1].plot(idx, pred_state[:, 1], lw=1.8, alpha=0.9, label="pred")
+    axs[1].set_ylabel("y(t)")
+    axs[1].grid(True, alpha=0.3)
+
+    axs[2].plot(idx, true_state[:, 2], lw=2, label="true")
+    axs[2].plot(idx, pred_state[:, 2], lw=1.8, alpha=0.9, label="pred")
+    axs[2].set_ylabel("vx(t)")
+    axs[2].grid(True, alpha=0.3)
+
+    axs[3].plot(idx, true_state[:, 3], lw=2, label="true")
+    axs[3].plot(idx, pred_state[:, 3], lw=1.8, alpha=0.9, label="pred")
+    axs[3].set_ylabel("vy(t)")
+    axs[3].grid(True, alpha=0.3)
+
+    axs[4].plot(idx, evt_prob, lw=2, label="pred p(event)")
+    axs[4].axhline(float(args.event_prob_threshold), color="k", ls="--", lw=1.0, alpha=0.6)
+    axs[4].set_ylabel("event")
+    axs[4].set_xlabel("step")
+    axs[4].set_ylim([-0.05, 1.05])
+    axs[4].grid(True, alpha=0.3)
+    axs[4].legend(loc="best")
+    fig.suptitle("TCNO single-IC diagnostics", y=0.995, fontsize=11)
+    plt.tight_layout()
+    plt.savefig(out_dir / "single_ic_state_and_event.png", dpi=140)
+    plt.close(fig)
+
+    summary = {
+        "mode": "single_ic",
+        "rollout_steps": int(rollout_steps),
+        "dt": float(dt),
+        "initial_state": [float(x) for x in s0.tolist()],
+        "final_state_pred": [float(x) for x in pred_state[-1].tolist()],
+        "final_state_true": [float(x) for x in true_state[-1].tolist()],
+        "state_mse": float(np.mean((pred_state - true_state) ** 2)),
+        "position_mse": float(np.mean((pred_state[:, :2] - true_state[:, :2]) ** 2)),
+        "velocity_mse": float(np.mean((pred_state[:, 2:] - true_state[:, 2:]) ** 2)),
+        "files": {
+            "overlay_video": "single_ic_gt_vs_pred_overlay_1p.mp4" if (not args.no_render and args.save_overlay) else None,
+            "state_event_plot": "single_ic_state_and_event.png",
+        },
+        "best_epoch": int(ckpt.get("best_epoch", -1)),
+        "best_val_state_mse": float(ckpt.get("best_val_state_mse", float("nan"))),
+    }
+    with open(out_dir / "single_ic_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    print("Saved:", out_dir / "single_ic_summary.json")
 
 
 def main() -> None:
@@ -310,6 +459,27 @@ def main() -> None:
     if y_std_state is not None:
         y_mean = np.asarray(y_std_state["mean"], dtype=np.float32)
         y_std = np.asarray(y_std_state["std"], dtype=np.float32)
+
+    if args.single_ic:
+        run_single_ic_eval(
+            model=model,
+            args=args,
+            ckpt=ckpt,
+            out_dir=out_dir,
+            dt=dt,
+            W=W,
+            H=H,
+            radius=radius,
+            mass=mass,
+            restitution=restitution,
+            wall_mode=wall_mode,
+            s0_mean=s0_mean,
+            s0_std=s0_std,
+            y_mean=y_mean,
+            y_std=y_std,
+            device=device,
+        )
+        return
 
     rows: list[dict[str, Any]] = []
     all_pred_state: list[np.ndarray] = []
