@@ -115,6 +115,20 @@ def renormalize_velocity_in_state(state: np.ndarray, target_speed: float, eps: f
     return out
 
 
+def renormalize_velocity_batch(states: np.ndarray, target_speed: float, eps: float = 1e-12) -> np.ndarray:
+    """Return a copy of (T,4) states with velocity magnitude fixed to target_speed."""
+    out = states.copy()
+    if target_speed <= 0.0:
+        return out
+    v = out[:, 2:4]
+    norms = np.linalg.norm(v, axis=1, keepdims=True)
+    mask = norms > eps
+    scale = np.ones_like(norms, dtype=np.float32)
+    scale[mask] = np.float32(target_speed) / norms[mask]
+    out[:, 2:4] = v * scale
+    return out.astype(np.float32)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Evaluate TimeConditionedCollisionModel checkpoint on train/val/test split."
@@ -175,6 +189,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fps", type=int, default=50)
     p.add_argument("--frame-stride", type=int, default=1)
     p.add_argument(
+        "--report-renorm-velocity",
+        type=str2bool,
+        default=False,
+        help="If true, also report/plot renormalized predicted velocities.",
+    )
+    p.add_argument(
+        "--report-renorm-speed",
+        type=float,
+        default=0.5,
+        help="Target speed used when --report-renorm-velocity=true.",
+    )
+    p.add_argument(
         "--renorm-speed",
         type=float,
         default=0.0,
@@ -230,6 +256,11 @@ def run_single_ic_eval(
             pred_state = (pred_state * y_std + y_mean).astype(np.float32)
         evt_logit_np = out["event_logit"].squeeze(1).cpu().numpy().astype(np.float32)
     evt_prob = 1.0 / (1.0 + np.exp(-np.clip(evt_logit_np, -60.0, 60.0)))
+    pred_state_renorm = (
+        renormalize_velocity_batch(pred_state, float(args.report_renorm_speed))
+        if args.report_renorm_velocity
+        else None
+    )
 
     # Build GT from the same IC for optional overlay/error diagnostics.
     sim_true = ParticleSim2D(
@@ -248,12 +279,19 @@ def run_single_ic_eval(
     true_pos = true_state[:, :2].reshape(T, 1, 2).astype(np.float32)
 
     final_pred = pred_state[-1].tolist()
+    final_pred_renorm = pred_state_renorm[-1].tolist() if pred_state_renorm is not None else None
     final_true = true_state[-1].tolist()
     print(
         "Single-IC final state @ step "
         f"{rollout_steps}: pred=[{final_pred[0]:.6f}, {final_pred[1]:.6f}, {final_pred[2]:.6f}, {final_pred[3]:.6f}] "
         f"true=[{final_true[0]:.6f}, {final_true[1]:.6f}, {final_true[2]:.6f}, {final_true[3]:.6f}]"
     )
+    if final_pred_renorm is not None:
+        print(
+            "Single-IC final state (renorm vel) @ step "
+            f"{rollout_steps}: pred_renorm=[{final_pred_renorm[0]:.6f}, {final_pred_renorm[1]:.6f}, "
+            f"{final_pred_renorm[2]:.6f}, {final_pred_renorm[3]:.6f}]"
+        )
 
     # Save overlay video and compact diagnostics.
     if not args.no_render and args.save_overlay:
@@ -285,12 +323,18 @@ def run_single_ic_eval(
 
     axs[2].plot(idx, true_state[:, 2], lw=2, label="true")
     axs[2].plot(idx, pred_state[:, 2], lw=1.8, alpha=0.9, label="pred")
+    if pred_state_renorm is not None:
+        axs[2].plot(idx, pred_state_renorm[:, 2], lw=1.2, ls="--", alpha=0.9, label="pred_renorm")
     axs[2].set_ylabel("vx(t)")
+    axs[2].legend(loc="best")
     axs[2].grid(True, alpha=0.3)
 
     axs[3].plot(idx, true_state[:, 3], lw=2, label="true")
     axs[3].plot(idx, pred_state[:, 3], lw=1.8, alpha=0.9, label="pred")
+    if pred_state_renorm is not None:
+        axs[3].plot(idx, pred_state_renorm[:, 3], lw=1.2, ls="--", alpha=0.9, label="pred_renorm")
     axs[3].set_ylabel("vy(t)")
+    axs[3].legend(loc="best")
     axs[3].grid(True, alpha=0.3)
 
     axs[4].plot(idx, evt_prob, lw=2, label="pred p(event)")
@@ -311,6 +355,9 @@ def run_single_ic_eval(
         "dt": float(dt),
         "initial_state": [float(x) for x in s0.tolist()],
         "final_state_pred": [float(x) for x in pred_state[-1].tolist()],
+        "final_state_pred_renorm": (
+            [float(x) for x in pred_state_renorm[-1].tolist()] if pred_state_renorm is not None else None
+        ),
         "final_state_true": [float(x) for x in true_state[-1].tolist()],
         "state_mse": float(np.mean((pred_state - true_state) ** 2)),
         "position_mse": float(np.mean((pred_state[:, :2] - true_state[:, :2]) ** 2)),
@@ -319,6 +366,8 @@ def run_single_ic_eval(
             "overlay_video": "single_ic_gt_vs_pred_overlay_1p.mp4" if (not args.no_render and args.save_overlay) else None,
             "state_event_plot": "single_ic_state_and_event.png",
         },
+        "report_renorm_velocity": bool(args.report_renorm_velocity),
+        "report_renorm_speed": float(args.report_renorm_speed),
         "best_epoch": int(ckpt.get("best_epoch", -1)),
         "best_val_state_mse": float(ckpt.get("best_val_state_mse", float("nan"))),
     }
@@ -343,6 +392,8 @@ def main() -> None:
         raise ValueError("--num-chunks must be >= 0")
     if args.renorm_speed < 0.0:
         raise ValueError("--renorm-speed must be >= 0")
+    if args.report_renorm_speed < 0.0:
+        raise ValueError("--report-renorm-speed must be >= 0")
 
     ckpt_path = Path(args.ckpt)
     out_dir = Path(args.out_dir)
@@ -616,6 +667,11 @@ def main() -> None:
 
         pred_pos = pred_state[:, :2].reshape(T, 1, 2).astype(np.float32)
         true_pos = true_state[:, :2].reshape(T, 1, 2).astype(np.float32)
+        pred_state_renorm = (
+            renormalize_velocity_batch(pred_state, float(args.report_renorm_speed))
+            if args.report_renorm_velocity
+            else None
+        )
         pos_err = np.linalg.norm(true_pos[:, 0, :] - pred_pos[:, 0, :], axis=1)
         div_idx = np.where(pos_err > float(args.divergence_threshold))[0]
         diverged = bool(len(div_idx) > 0)
@@ -699,12 +755,18 @@ def main() -> None:
 
             axs_state[2].plot(np.arange(T), true_state[:, 2], lw=2, label="true")
             axs_state[2].plot(np.arange(T), pred_state[:, 2], lw=1.8, alpha=0.9, label="pred")
+            if pred_state_renorm is not None:
+                axs_state[2].plot(np.arange(T), pred_state_renorm[:, 2], lw=1.2, ls="--", alpha=0.9, label="pred_renorm")
             axs_state[2].set_ylabel("vx(t)")
+            axs_state[2].legend(loc="best")
             axs_state[2].grid(True, alpha=0.3)
 
             axs_state[3].plot(np.arange(T), true_state[:, 3], lw=2, label="true")
             axs_state[3].plot(np.arange(T), pred_state[:, 3], lw=1.8, alpha=0.9, label="pred")
+            if pred_state_renorm is not None:
+                axs_state[3].plot(np.arange(T), pred_state_renorm[:, 3], lw=1.2, ls="--", alpha=0.9, label="pred_renorm")
             axs_state[3].set_ylabel("vy(t)")
+            axs_state[3].legend(loc="best")
             axs_state[3].grid(True, alpha=0.3)
 
             axs_state[4].plot(np.arange(T), evt_prob, lw=2, label="pred p(event)")
@@ -771,6 +833,8 @@ def main() -> None:
         "rows": rows,
         "best_epoch": int(ckpt.get("best_epoch", -1)),
         "best_val_state_mse": float(ckpt.get("best_val_state_mse", float("nan"))),
+        "report_renorm_velocity": bool(args.report_renorm_velocity),
+        "report_renorm_speed": float(args.report_renorm_speed),
     }
     with open(out_dir / "eval_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
