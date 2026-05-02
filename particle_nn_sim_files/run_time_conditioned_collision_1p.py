@@ -378,11 +378,15 @@ def evaluate(
     device: str,
     state_std: Standardizer | None,
     plateau_event_threshold: float = 0.1,
+    sign_epsilon: float = 1e-6,
 ) -> dict[str, float]:
     model.eval()
     state_preds: list[np.ndarray] = []
     state_targets: list[np.ndarray] = []
     event_targets: list[np.ndarray] = []
+    run_evt_bce = 0.0
+    run_sign_bce = 0.0
+    n_batches = 0
 
     for s0, t_q, y_state, y_event in loader:
         s0 = s0.to(device)
@@ -391,6 +395,12 @@ def evaluate(
         y_event = y_event.to(device)
         out = model(s0, t_q)
         pred_state = out["state"]
+        evt_logit = out["event_logit"]
+        evt_bce = F.binary_cross_entropy_with_logits(evt_logit.squeeze(1), y_event)
+        sign_bce = velocity_sign_loss(pred_state[:, 2:], y_state[:, 2:], sign_epsilon=sign_epsilon)
+        run_evt_bce += float(evt_bce.item())
+        run_sign_bce += float(sign_bce.item())
+        n_batches += 1
         state_preds.append(pred_state.cpu().numpy())
         state_targets.append(y_state.cpu().numpy())
         event_targets.append(y_event.cpu().numpy())
@@ -417,6 +427,8 @@ def evaluate(
         "position_mse": pos_mse,
         "velocity_mse": vel_mse,
         "plateau_velocity_mse": plateau_vel_mse,
+        "event_bce_loss": run_evt_bce / max(1, n_batches),
+        "sign_bce_loss": run_sign_bce / max(1, n_batches),
     }
 
 
@@ -909,6 +921,10 @@ def main() -> None:
         "val_position_mse": [],
         "val_velocity_mse": [],
         "val_plateau_velocity_mse": [],
+        "val_event_bce_loss": [],
+        "val_sign_bce_loss": [],
+        "test_event_bce_loss": [],
+        "test_sign_bce_loss": [],
     }
     best = {"epoch": -1, "val_state_mse": float("inf"), "state_dict": None}
 
@@ -987,6 +1003,7 @@ def main() -> None:
             device=device,
             state_std=y_std,
             plateau_event_threshold=train_cfg.plateau_event_threshold,
+            sign_epsilon=run_cfg.sign_epsilon,
         )
         test_metrics = evaluate(
             model=model,
@@ -994,6 +1011,7 @@ def main() -> None:
             device=device,
             state_std=y_std,
             plateau_event_threshold=train_cfg.plateau_event_threshold,
+            sign_epsilon=run_cfg.sign_epsilon,
         )
 
         history["train_total_loss"].append(train_total)
@@ -1006,6 +1024,10 @@ def main() -> None:
         history["val_position_mse"].append(val_metrics["position_mse"])
         history["val_velocity_mse"].append(val_metrics["velocity_mse"])
         history["val_plateau_velocity_mse"].append(val_metrics["plateau_velocity_mse"])
+        history["val_event_bce_loss"].append(val_metrics["event_bce_loss"])
+        history["val_sign_bce_loss"].append(val_metrics["sign_bce_loss"])
+        history["test_event_bce_loss"].append(test_metrics["event_bce_loss"])
+        history["test_sign_bce_loss"].append(test_metrics["sign_bce_loss"])
 
         if val_metrics["state_mse"] < best["val_state_mse"]:
             best["val_state_mse"] = val_metrics["state_mse"]
@@ -1026,11 +1048,15 @@ def main() -> None:
                     "val_position_mse": val_metrics["position_mse"],
                     "val_velocity_mse": val_metrics["velocity_mse"],
                     "val_plateau_velocity_mse": val_metrics["plateau_velocity_mse"],
+                    "val_event_bce_loss": val_metrics["event_bce_loss"],
+                    "val_sign_bce_loss": val_metrics["sign_bce_loss"],
                     "lr": lr_now,
                     "test_state_mse": test_metrics["state_mse"],
                     "test_position_mse": test_metrics["position_mse"],
                     "test_velocity_mse": test_metrics["velocity_mse"],
                     "test_plateau_velocity_mse": test_metrics["plateau_velocity_mse"],
+                    "test_event_bce_loss": test_metrics["event_bce_loss"],
+                    "test_sign_bce_loss": test_metrics["sign_bce_loss"],
                     "best_val_state_mse_so_far": best["val_state_mse"],
                     "best_epoch_so_far": best["epoch"],
                 }
@@ -1052,9 +1078,9 @@ def main() -> None:
         model.load_state_dict(best["state_dict"])
 
     # Final metrics using best-by-val model.
-    final_train = evaluate(model, train_loader, device, y_std, train_cfg.plateau_event_threshold)
-    final_val = evaluate(model, val_loader, device, y_std, train_cfg.plateau_event_threshold)
-    final_test = evaluate(model, test_loader, device, y_std, train_cfg.plateau_event_threshold)
+    final_train = evaluate(model, train_loader, device, y_std, train_cfg.plateau_event_threshold, run_cfg.sign_epsilon)
+    final_val = evaluate(model, val_loader, device, y_std, train_cfg.plateau_event_threshold, run_cfg.sign_epsilon)
+    final_test = evaluate(model, test_loader, device, y_std, train_cfg.plateau_event_threshold, run_cfg.sign_epsilon)
 
     # Visualization for one test episode.
     plot_ep_local = int(np.clip(run_cfg.plot_episode_idx, 0, len(test_eps) - 1))
