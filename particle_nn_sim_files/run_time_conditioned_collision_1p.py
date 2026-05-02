@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.cuda.amp import GradScaler, autocast
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
@@ -47,6 +48,11 @@ class TrainConfig:
     train_split: float = 0.7
     val_split: float = 0.15
     normalize: bool = True
+    use_amp: bool = True
+    eval_every: int = 1
+    s0_pos_noise_std: float = 0.0
+    s0_vel_noise_std: float = 0.0
+    noise_decay_epochs: int = 0
     use_flat_velocity_reg: bool = True
     flat_dt: float = 0.01
     plateau_event_threshold: float = 0.1
@@ -561,6 +567,11 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--train-split", type=float, default=0.7)
     p.add_argument("--val-split", type=float, default=0.15)
     p.add_argument("--normalize", type=str2bool, default=True)
+    p.add_argument("--use-amp", type=str2bool, default=True)
+    p.add_argument("--eval-every", type=int, default=1)
+    p.add_argument("--s0-pos-noise-std", type=float, default=0.0)
+    p.add_argument("--s0-vel-noise-std", type=float, default=0.0)
+    p.add_argument("--noise-decay-epochs", type=int, default=0)
     p.add_argument("--use-flat-velocity-reg", type=str2bool, default=True)
     p.add_argument("--flat-dt", type=float, default=0.01)
     p.add_argument("--plateau-event-threshold", type=float, default=0.1)
@@ -602,6 +613,14 @@ def main() -> None:
         raise ValueError("--flat-dt must be >= 0")
     if args.lr_step_size < 1:
         raise ValueError("--lr-step-size must be >= 1")
+    if args.eval_every < 1:
+        raise ValueError("--eval-every must be >= 1")
+    if args.s0_pos_noise_std < 0.0:
+        raise ValueError("--s0-pos-noise-std must be >= 0")
+    if args.s0_vel_noise_std < 0.0:
+        raise ValueError("--s0-vel-noise-std must be >= 0")
+    if args.noise_decay_epochs < 0:
+        raise ValueError("--noise-decay-epochs must be >= 0")
     if not (0.0 < args.lr_gamma <= 1.0):
         raise ValueError("--lr-gamma must be in (0,1]")
     if not (0.0 <= args.plateau_event_threshold <= 1.0):
@@ -667,6 +686,11 @@ def main() -> None:
         train_split=args.train_split,
         val_split=args.val_split,
         normalize=args.normalize,
+        use_amp=args.use_amp,
+        eval_every=args.eval_every,
+        s0_pos_noise_std=args.s0_pos_noise_std,
+        s0_vel_noise_std=args.s0_vel_noise_std,
+        noise_decay_epochs=args.noise_decay_epochs,
         use_flat_velocity_reg=args.use_flat_velocity_reg,
         flat_dt=args.flat_dt,
         plateau_event_threshold=args.plateau_event_threshold,
@@ -909,6 +933,8 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.StepLR(
         opt, step_size=int(train_cfg.lr_step_size), gamma=float(train_cfg.lr_gamma)
     )
+    amp_enabled = bool(train_cfg.use_amp) and str(device).startswith("cuda")
+    scaler = GradScaler(enabled=amp_enabled)
 
     history: dict[str, list[float]] = {
         "train_total_loss": [],
@@ -927,6 +953,8 @@ def main() -> None:
         "test_sign_bce_loss": [],
     }
     best = {"epoch": -1, "val_state_mse": float("inf"), "state_dict": None}
+    last_val_metrics: dict[str, float] | None = None
+    last_test_metrics: dict[str, float] | None = None
 
     # Training loop.
     train_t0_err = evaluate_t0_anchor_error(model=model, loader=train_loader, device=device)
@@ -940,6 +968,12 @@ def main() -> None:
     prev_lr: float | None = None
     for ep in range(1, train_cfg.epochs + 1):
         lr_now = float(opt.param_groups[0]["lr"])
+        if train_cfg.noise_decay_epochs > 0:
+            noise_scale = max(0.0, 1.0 - float(ep - 1) / float(train_cfg.noise_decay_epochs))
+        else:
+            noise_scale = 1.0
+        pos_noise_std_ep = float(train_cfg.s0_pos_noise_std) * noise_scale
+        vel_noise_std_ep = float(train_cfg.s0_vel_noise_std) * noise_scale
         model.train()
         run_total = 0.0
         run_pos = 0.0
@@ -953,34 +987,49 @@ def main() -> None:
             t_q = t_q.to(device)
             y_state = y_state.to(device)
             y_event = y_event.to(device)
-
-            out = model(s0, t_q)
-            pred_state = out["state"]
-            evt_logit = out["event_logit"]
-            pos_mse = F.mse_loss(pred_state[:, :2], y_state[:, :2])
-            vel_mse = F.mse_loss(pred_state[:, 2:], y_state[:, 2:])
-            evt_bce = F.binary_cross_entropy_with_logits(evt_logit.squeeze(1), y_event)
-            sign_bce = velocity_sign_loss(pred_state[:, 2:], y_state[:, 2:], sign_epsilon=run_cfg.sign_epsilon)
-            flat_reg = pred_state.new_zeros(())
-            if train_cfg.use_flat_velocity_reg and train_cfg.flat_dt > 0.0:
-                t_pair = torch.clamp(t_q + float(train_cfg.flat_dt), min=0.0, max=float(model_cfg.time_encoding.max_time))
-                out_pair = model(s0, t_pair)
-                vel_now = pred_state[:, 2:]
-                vel_next = out_pair["state"][:, 2:]
-                away_weight = torch.clamp(1.0 - y_event, min=0.0, max=1.0).unsqueeze(1)
-                flat_reg = torch.mean(away_weight * (vel_next - vel_now) ** 2)
-            loss = (
-                lw.lambda_pos * pos_mse
-                + lw.lambda_vel * vel_mse
-                + lw.lambda_event * evt_bce
-                + lw.lambda_sign * sign_bce
-                + lw.lambda_flat * flat_reg
-            )
+            if pos_noise_std_ep > 0.0 or vel_noise_std_ep > 0.0:
+                s0_noisy = s0.clone()
+                if pos_noise_std_ep > 0.0:
+                    s0_noisy[:, :2] = s0_noisy[:, :2] + torch.randn_like(s0_noisy[:, :2]) * pos_noise_std_ep
+                if vel_noise_std_ep > 0.0:
+                    s0_noisy[:, 2:] = s0_noisy[:, 2:] + torch.randn_like(s0_noisy[:, 2:]) * vel_noise_std_ep
+            else:
+                s0_noisy = s0
 
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            with autocast(enabled=amp_enabled):
+                out = model(s0_noisy, t_q)
+                pred_state = out["state"]
+                evt_logit = out["event_logit"]
+                pos_mse = F.mse_loss(pred_state[:, :2], y_state[:, :2])
+                vel_mse = F.mse_loss(pred_state[:, 2:], y_state[:, 2:])
+                evt_bce = F.binary_cross_entropy_with_logits(evt_logit.squeeze(1), y_event)
+                sign_bce = velocity_sign_loss(pred_state[:, 2:], y_state[:, 2:], sign_epsilon=run_cfg.sign_epsilon)
+                flat_reg = pred_state.new_zeros(())
+                if train_cfg.use_flat_velocity_reg and train_cfg.flat_dt > 0.0:
+                    t_pair = torch.clamp(
+                        t_q + float(train_cfg.flat_dt),
+                        min=0.0,
+                        max=float(model_cfg.time_encoding.max_time),
+                    )
+                    out_pair = model(s0_noisy, t_pair)
+                    vel_now = pred_state[:, 2:]
+                    vel_next = out_pair["state"][:, 2:]
+                    away_weight = torch.clamp(1.0 - y_event, min=0.0, max=1.0).unsqueeze(1)
+                    flat_reg = torch.mean(away_weight * (vel_next - vel_now) ** 2)
+                loss = (
+                    lw.lambda_pos * pos_mse
+                    + lw.lambda_vel * vel_mse
+                    + lw.lambda_event * evt_bce
+                    + lw.lambda_sign * sign_bce
+                    + lw.lambda_flat * flat_reg
+                )
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
 
             run_total += float(loss.item())
             run_pos += float(pos_mse.item())
@@ -997,22 +1046,31 @@ def main() -> None:
         train_sign = run_sign / max(1, n_batches)
         train_flat = run_flat / max(1, n_batches)
 
-        val_metrics = evaluate(
-            model=model,
-            loader=val_loader,
-            device=device,
-            state_std=y_std,
-            plateau_event_threshold=train_cfg.plateau_event_threshold,
-            sign_epsilon=run_cfg.sign_epsilon,
-        )
-        test_metrics = evaluate(
-            model=model,
-            loader=test_loader,
-            device=device,
-            state_std=y_std,
-            plateau_event_threshold=train_cfg.plateau_event_threshold,
-            sign_epsilon=run_cfg.sign_epsilon,
-        )
+        do_eval = (ep == 1) or (ep == train_cfg.epochs) or (ep % max(1, train_cfg.eval_every) == 0)
+        if do_eval:
+            val_metrics = evaluate(
+                model=model,
+                loader=val_loader,
+                device=device,
+                state_std=y_std,
+                plateau_event_threshold=train_cfg.plateau_event_threshold,
+                sign_epsilon=run_cfg.sign_epsilon,
+            )
+            test_metrics = evaluate(
+                model=model,
+                loader=test_loader,
+                device=device,
+                state_std=y_std,
+                plateau_event_threshold=train_cfg.plateau_event_threshold,
+                sign_epsilon=run_cfg.sign_epsilon,
+            )
+            last_val_metrics = val_metrics
+            last_test_metrics = test_metrics
+        else:
+            val_metrics = last_val_metrics
+            test_metrics = last_test_metrics
+        if val_metrics is None or test_metrics is None:
+            continue
 
         history["train_total_loss"].append(train_total)
         history["train_pos_mse_loss"].append(train_pos)
@@ -1029,7 +1087,7 @@ def main() -> None:
         history["test_event_bce_loss"].append(test_metrics["event_bce_loss"])
         history["test_sign_bce_loss"].append(test_metrics["sign_bce_loss"])
 
-        if val_metrics["state_mse"] < best["val_state_mse"]:
+        if do_eval and val_metrics["state_mse"] < best["val_state_mse"]:
             best["val_state_mse"] = val_metrics["state_mse"]
             best["epoch"] = ep
             best["state_dict"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -1059,15 +1117,19 @@ def main() -> None:
                     "test_sign_bce_loss": test_metrics["sign_bce_loss"],
                     "best_val_state_mse_so_far": best["val_state_mse"],
                     "best_epoch_so_far": best["epoch"],
+                    "train_s0_pos_noise_std": pos_noise_std_ep,
+                    "train_s0_vel_noise_std": vel_noise_std_ep,
                 }
             )
 
         lr_note = f" | lr={lr_now:.6g}" if prev_lr is None or abs(lr_now - prev_lr) > 0.0 else ""
+        eval_tag = "eval" if do_eval else "cached_eval"
         print(
             f"Epoch {ep:04d} | train_total={train_total:.6f} pos={train_pos:.6f} vel={train_vel:.6f} evt={train_evt:.6f} sign={train_sign:.6f} flat={train_flat:.6f} "
             f"| val_state={val_metrics['state_mse']:.6f} "
             f"| test_state={test_metrics['state_mse']:.6f} "
-            f"| best_epoch={best['epoch']}"
+            f"| best_epoch={best['epoch']} | {eval_tag} "
+            f"| noise(pos={pos_noise_std_ep:.3g}, vel={vel_noise_std_ep:.3g})"
         )
         if lr_note:
             print(f"  learning_rate_update{lr_note}")
