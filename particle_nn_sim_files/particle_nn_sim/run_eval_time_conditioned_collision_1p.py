@@ -408,6 +408,23 @@ def run_single_ic_eval(
             }
             axs_cmp[0].plot(x_axis, pred_win[:, 0], lw=1.3, alpha=0.9, label=f"pred@a={a}({args.anchor_source})")
             axs_cmp[1].plot(x_axis, pred_win[:, 1], lw=1.3, alpha=0.9, label=f"pred@a={a}({args.anchor_source})")
+            if (not args.no_render) and args.save_overlay:
+                gt_pos_win = gt_win[:, :2].reshape(gt_win.shape[0], 1, 2).astype(np.float32)
+                pred_pos_win = pred_win[:, :2].reshape(pred_win.shape[0], 1, 2).astype(np.float32)
+                overlay_cmp = animate_overlay_gt_perturbed_1p(
+                    pos_ref=gt_pos_win[:: args.frame_stride],
+                    pos_pert=pred_pos_win[:: args.frame_stride],
+                    radius=radius,
+                    W=W,
+                    H=H,
+                    dt=float(dt) * float(args.frame_stride),
+                    title=f"Single-IC anchor compare [{ws},{we}] a={a} ({args.anchor_source})",
+                    label_ref="GT",
+                    label_pert=f"pred@a={a}",
+                )
+                overlay_name = f"single_ic_anchor_{int(a):04d}_{args.anchor_source}_window_{ws}_{we}_overlay.mp4"
+                save_animation_mp4(overlay_cmp, str(out_dir / overlay_name), fps=args.fps)
+                anchor_results[str(a)]["video_overlay"] = overlay_name
         axs_cmp[0].set_ylabel("x")
         axs_cmp[1].set_ylabel("y")
         axs_cmp[1].set_xlabel("global step")
@@ -889,6 +906,26 @@ def main() -> None:
                 }
                 axs_cmp[0].plot(x_axis, pred_win[:, 0], lw=1.3, alpha=0.9, label=f"pred@a={a}({args.anchor_source})")
                 axs_cmp[1].plot(x_axis, pred_win[:, 1], lw=1.3, alpha=0.9, label=f"pred@a={a}({args.anchor_source})")
+                if (not args.no_render) and args.save_overlay:
+                    gt_pos_win = gt_win[:, :2].reshape(gt_win.shape[0], 1, 2).astype(np.float32)
+                    pred_pos_win = pred_win[:, :2].reshape(pred_win.shape[0], 1, 2).astype(np.float32)
+                    overlay_cmp = animate_overlay_gt_perturbed_1p(
+                        pos_ref=gt_pos_win[:: args.frame_stride],
+                        pos_pert=pred_pos_win[:: args.frame_stride],
+                        radius=radius,
+                        W=W,
+                        H=H,
+                        dt=float(dt) * float(args.frame_stride),
+                        title=f"{args.split} ep={e} anchor compare [{ws},{we}] a={a} ({args.anchor_source})",
+                        label_ref="GT",
+                        label_pert=f"pred@a={a}",
+                    )
+                    overlay_name = (
+                        f"{args.split}_ep_{e:05d}_anchor_{int(a):04d}_{args.anchor_source}_"
+                        f"window_{ws}_{we}_overlay.mp4"
+                    )
+                    save_animation_mp4(overlay_cmp, str(out_dir / overlay_name), fps=args.fps)
+                    anchor_results[str(a)]["video_overlay"] = overlay_name
             axs_cmp[0].set_ylabel("x")
             axs_cmp[1].set_ylabel("y")
             axs_cmp[1].set_xlabel("global step")
