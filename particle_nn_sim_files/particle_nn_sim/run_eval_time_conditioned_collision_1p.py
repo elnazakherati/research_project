@@ -218,6 +218,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--compare-window-start", type=int, default=-1, help="Global start step for anchor-window compare.")
     p.add_argument("--compare-window-end", type=int, default=-1, help="Global end step (inclusive) for anchor-window compare.")
+    p.add_argument(
+        "--anchor-source",
+        type=str,
+        default="gt",
+        choices=["gt", "pred"],
+        help="Source of anchor states for anchor-window compare: ground-truth or model-predicted trajectory.",
+    )
     p.add_argument("--out-dir", type=str, default="checkpoints/eval_tc_collision_1p")
     return p.parse_args()
 
@@ -378,13 +385,14 @@ def run_single_ic_eval(
         x_axis = np.arange(ws, we + 1, dtype=np.int64)
         axs_cmp[0].plot(x_axis, gt_win[:, 0], lw=2, label="GT x")
         axs_cmp[1].plot(x_axis, gt_win[:, 1], lw=2, label="GT y")
+        anchor_state_source = pred_state if args.anchor_source == "pred" else true_state
         for a in anchor_steps:
             if a > ws or a > max_step:
                 continue
             q = np.arange(ws, we + 1, dtype=np.int64) - int(a)
             pred_win = _predict_window_from_anchor(
                 model=model,
-                anchor_state=true_state[int(a)].astype(np.float32),
+                anchor_state=anchor_state_source[int(a)].astype(np.float32),
                 query_steps_from_anchor=q,
                 dt=dt,
                 s0_mean=s0_mean,
@@ -398,8 +406,8 @@ def run_single_ic_eval(
                 "position_mse": float(np.mean((pred_win[:, :2] - gt_win[:, :2]) ** 2)),
                 "velocity_mse": float(np.mean((pred_win[:, 2:] - gt_win[:, 2:]) ** 2)),
             }
-            axs_cmp[0].plot(x_axis, pred_win[:, 0], lw=1.3, alpha=0.9, label=f"pred@a={a}")
-            axs_cmp[1].plot(x_axis, pred_win[:, 1], lw=1.3, alpha=0.9, label=f"pred@a={a}")
+            axs_cmp[0].plot(x_axis, pred_win[:, 0], lw=1.3, alpha=0.9, label=f"pred@a={a}({args.anchor_source})")
+            axs_cmp[1].plot(x_axis, pred_win[:, 1], lw=1.3, alpha=0.9, label=f"pred@a={a}({args.anchor_source})")
         axs_cmp[0].set_ylabel("x")
         axs_cmp[1].set_ylabel("y")
         axs_cmp[1].set_xlabel("global step")
@@ -414,6 +422,7 @@ def run_single_ic_eval(
         anchor_compare_payload = {
             "window_start": ws,
             "window_end": we,
+            "anchor_source": str(args.anchor_source),
             "anchors": anchor_results,
             "plot": cmp_plot.name,
         }
@@ -777,6 +786,7 @@ def main() -> None:
                 true_state = np.concatenate(true_chunks, axis=0)
             else:
                 true_state = true_state_full[1 : 1 + pred_state.shape[0]]
+            pred_state_full = np.concatenate([s0[None, :], pred_state], axis=0).astype(np.float32)
         else:
             T = pos_true.shape[0]
             s0_batch = np.repeat(s0[None, :], T, axis=0).astype(np.float32)
@@ -794,6 +804,7 @@ def main() -> None:
                 evt_logit_np = out["event_logit"].squeeze(1).cpu().numpy().astype(np.float32)
             true_state = np.concatenate([pos_true[:, 0, :], vel_true[:, 0, :]], axis=1).astype(np.float32)
             true_state_full = true_state
+            pred_state_full = pred_state
 
         T = pred_state.shape[0]
         if chunk_mode and args.chunk_anchor_mode == "nnref":
@@ -850,6 +861,7 @@ def main() -> None:
             x_axis = np.arange(ws, we + 1, dtype=np.int64)
             axs_cmp[0].plot(x_axis, gt_win[:, 0], lw=2, label="GT x")
             axs_cmp[1].plot(x_axis, gt_win[:, 1], lw=2, label="GT y")
+            anchor_state_source = pred_state_full if args.anchor_source == "pred" else true_state_full
             for a in anchor_steps:
                 if a > ws:
                     continue
@@ -858,7 +870,7 @@ def main() -> None:
                 q = np.arange(ws, we + 1, dtype=np.int64) - int(a)
                 pred_win = _predict_window_from_anchor(
                     model=model,
-                    anchor_state=true_state_full[int(a)].astype(np.float32),
+                    anchor_state=anchor_state_source[int(a)].astype(np.float32),
                     query_steps_from_anchor=q,
                     dt=dt,
                     s0_mean=s0_mean,
@@ -875,8 +887,8 @@ def main() -> None:
                     "position_mse": mse_pos,
                     "velocity_mse": mse_vel,
                 }
-                axs_cmp[0].plot(x_axis, pred_win[:, 0], lw=1.3, alpha=0.9, label=f"pred@a={a}")
-                axs_cmp[1].plot(x_axis, pred_win[:, 1], lw=1.3, alpha=0.9, label=f"pred@a={a}")
+                axs_cmp[0].plot(x_axis, pred_win[:, 0], lw=1.3, alpha=0.9, label=f"pred@a={a}({args.anchor_source})")
+                axs_cmp[1].plot(x_axis, pred_win[:, 1], lw=1.3, alpha=0.9, label=f"pred@a={a}({args.anchor_source})")
             axs_cmp[0].set_ylabel("x")
             axs_cmp[1].set_ylabel("y")
             axs_cmp[1].set_xlabel("global step")
@@ -891,6 +903,7 @@ def main() -> None:
             row["anchor_window_compare"] = {
                 "window_start": ws,
                 "window_end": we,
+                "anchor_source": str(args.anchor_source),
                 "anchors": anchor_results,
                 "plot": cmp_plot.name,
             }
