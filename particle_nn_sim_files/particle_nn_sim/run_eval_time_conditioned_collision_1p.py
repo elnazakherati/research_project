@@ -225,6 +225,29 @@ def parse_args() -> argparse.Namespace:
         choices=["gt", "pred"],
         help="Source of anchor states for anchor-window compare: ground-truth or model-predicted trajectory.",
     )
+    p.add_argument(
+        "--restart-from-error-buckets",
+        type=str2bool,
+        default=False,
+        help="If true (single-IC mode), compare restart rollouts from low-error vs high-error predicted anchor states.",
+    )
+    p.add_argument(
+        "--restart-bucket-metric",
+        type=str,
+        default="state_l2",
+        choices=["state_l2", "pos_l2"],
+        help="Per-step error metric used to bucket anchors into low/high groups.",
+    )
+    p.add_argument("--restart-low-quantile", type=float, default=0.1)
+    p.add_argument("--restart-high-quantile", type=float, default=0.9)
+    p.add_argument("--restart-max-anchors", type=int, default=20)
+    p.add_argument("--restart-min-anchor-step", type=int, default=1)
+    p.add_argument(
+        "--restart-max-anchor-step",
+        type=int,
+        default=-1,
+        help="Max anchor step for restart buckets. -1 means up to rollout_steps-1.",
+    )
     p.add_argument("--out-dir", type=str, default="checkpoints/eval_tc_collision_1p")
     return p.parse_args()
 
@@ -528,6 +551,119 @@ def run_single_ic_eval(
             ),
         }
 
+    restart_bucket_payload: dict[str, Any] | None = None
+    if args.restart_from_error_buckets:
+        metric_name = str(args.restart_bucket_metric)
+        if metric_name == "state_l2":
+            base_err = np.linalg.norm(pred_state - true_state, axis=1).astype(np.float32)
+        else:
+            base_err = np.linalg.norm(pred_state[:, :2] - true_state[:, :2], axis=1).astype(np.float32)
+
+        lo_q = float(args.restart_low_quantile)
+        hi_q = float(args.restart_high_quantile)
+        lo_q = max(0.0, min(lo_q, 1.0))
+        hi_q = max(0.0, min(hi_q, 1.0))
+        if hi_q < lo_q:
+            lo_q, hi_q = hi_q, lo_q
+
+        a_min = max(1, int(args.restart_min_anchor_step))
+        a_max = (T - 2) if int(args.restart_max_anchor_step) < 0 else min(int(args.restart_max_anchor_step), T - 2)
+        if a_max >= a_min:
+            valid_idx = np.arange(a_min, a_max + 1, dtype=np.int64)
+            valid_err = base_err[valid_idx]
+            lo_thr = float(np.quantile(valid_err, lo_q))
+            hi_thr = float(np.quantile(valid_err, hi_q))
+            low_idx = valid_idx[valid_err <= lo_thr]
+            high_idx = valid_idx[valid_err >= hi_thr]
+
+            max_a = max(1, int(args.restart_max_anchors))
+            low_idx = low_idx[:max_a]
+            high_idx = high_idx[:max_a]
+
+            low_curves: list[np.ndarray] = []
+            high_curves: list[np.ndarray] = []
+            low_rows: list[dict[str, Any]] = []
+            high_rows: list[dict[str, Any]] = []
+
+            def _collect_restart(anchor_step: int) -> tuple[np.ndarray, dict[str, Any]]:
+                q = np.arange(anchor_step, T, dtype=np.int64) - int(anchor_step)
+                pred_win = _predict_window_from_anchor(
+                    model=model,
+                    anchor_state=pred_state[int(anchor_step)].astype(np.float32),
+                    query_steps_from_anchor=q,
+                    dt=dt,
+                    s0_mean=s0_mean,
+                    s0_std=s0_std,
+                    y_mean=y_mean,
+                    y_std=y_std,
+                    device=device,
+                )
+                gt_win = true_state[int(anchor_step) : T].astype(np.float32)
+                err_curve = np.linalg.norm(pred_win[:, :2] - gt_win[:, :2], axis=1).astype(np.float32)
+                row = {
+                    "anchor_step": int(anchor_step),
+                    "base_err_at_anchor": float(base_err[int(anchor_step)]),
+                    "pos_err_mean": float(np.mean(err_curve)),
+                    "pos_err_max": float(np.max(err_curve)),
+                    "pos_err_final": float(err_curve[-1]),
+                    "state_err_final": float(np.linalg.norm(pred_win[-1] - gt_win[-1])),
+                }
+                return err_curve, row
+
+            for a in low_idx.tolist():
+                c, r = _collect_restart(int(a))
+                low_curves.append(c)
+                low_rows.append(r)
+            for a in high_idx.tolist():
+                c, r = _collect_restart(int(a))
+                high_curves.append(c)
+                high_rows.append(r)
+
+            # Plot restart error over global time, comparing low-error vs high-error anchor buckets.
+            fig_rb, ax_rb = plt.subplots(figsize=(9, 5))
+            for row, c in zip(low_rows, low_curves):
+                x = np.arange(int(row["anchor_step"]), T, dtype=np.int64)
+                ax_rb.plot(x, c, color="tab:green", alpha=0.18, lw=1.0)
+            for row, c in zip(high_rows, high_curves):
+                x = np.arange(int(row["anchor_step"]), T, dtype=np.int64)
+                ax_rb.plot(x, c, color="tab:red", alpha=0.18, lw=1.0)
+            if low_rows:
+                for row, c in zip(low_rows[:1], low_curves[:1]):
+                    x = np.arange(int(row["anchor_step"]), T, dtype=np.int64)
+                    ax_rb.plot(x, c, color="tab:green", lw=2.0, alpha=0.9, label="low-error anchors")
+                    break
+            if high_rows:
+                for row, c in zip(high_rows[:1], high_curves[:1]):
+                    x = np.arange(int(row["anchor_step"]), T, dtype=np.int64)
+                    ax_rb.plot(x, c, color="tab:red", lw=2.0, alpha=0.9, label="high-error anchors")
+                    break
+            ax_rb.set_xlabel("global step")
+            ax_rb.set_ylabel("||pos_pred - pos_true||")
+            ax_rb.set_title("Restart rollout error from low vs high anchor-error states")
+            ax_rb.grid(True, alpha=0.3)
+            ax_rb.legend(loc="best")
+            plt.tight_layout()
+            restart_plot = out_dir / "single_ic_restart_error_buckets.png"
+            plt.savefig(restart_plot, dpi=140)
+            plt.close(fig_rb)
+
+            restart_bucket_payload = {
+                "metric": metric_name,
+                "low_quantile": lo_q,
+                "high_quantile": hi_q,
+                "low_threshold": lo_thr,
+                "high_threshold": hi_thr,
+                "anchor_min_step": a_min,
+                "anchor_max_step": a_max,
+                "low_count": len(low_rows),
+                "high_count": len(high_rows),
+                "low_rows": low_rows,
+                "high_rows": high_rows,
+                "plot": restart_plot.name,
+                "low_pos_err_final_mean": (float(np.mean([r["pos_err_final"] for r in low_rows])) if low_rows else None),
+                "high_pos_err_final_mean": (float(np.mean([r["pos_err_final"] for r in high_rows])) if high_rows else None),
+            }
+
     # Save overlay video and compact diagnostics.
     if not args.no_render and args.save_overlay:
         overlay = animate_overlay_gt_perturbed_1p(
@@ -619,6 +755,7 @@ def run_single_ic_eval(
         "num_chunks": int(args.num_chunks),
         "boundary_renorm_speed": float(args.renorm_speed),
         "anchor_window_compare": anchor_compare_payload,
+        "restart_error_buckets": restart_bucket_payload,
         "best_epoch": int(ckpt.get("best_epoch", -1)),
         "best_val_state_mse": float(ckpt.get("best_val_state_mse", float("nan"))),
     }
