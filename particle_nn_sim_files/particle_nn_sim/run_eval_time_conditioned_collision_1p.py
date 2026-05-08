@@ -383,6 +383,9 @@ def run_single_ic_eval(
         anchor_results: dict[str, Any] = {}
         err_curves: list[np.ndarray] = []
         err_labels: list[str] = []
+        final_pos_errs: list[float] = []
+        final_state_errs: list[float] = []
+        final_anchor_steps: list[int] = []
         fig_cmp, axs_cmp = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
         x_axis = np.arange(ws, we + 1, dtype=np.int64)
         axs_cmp[0].plot(x_axis, gt_win[:, 0], lw=2, label="GT x")
@@ -404,14 +407,21 @@ def run_single_ic_eval(
                 device=device,
             )
             pos_err_curve = np.linalg.norm(pred_win[:, :2] - gt_win[:, :2], axis=1).astype(np.float32)
+            final_pos_err = float(pos_err_curve[-1])
+            final_state_err = float(np.linalg.norm(pred_win[-1] - gt_win[-1]))
             err_curves.append(pos_err_curve)
             err_labels.append(f"a={a} ({args.anchor_source})")
+            final_pos_errs.append(final_pos_err)
+            final_state_errs.append(final_state_err)
+            final_anchor_steps.append(int(a))
             anchor_results[str(a)] = {
                 "state_mse": float(np.mean((pred_win - gt_win) ** 2)),
                 "position_mse": float(np.mean((pred_win[:, :2] - gt_win[:, :2]) ** 2)),
                 "velocity_mse": float(np.mean((pred_win[:, 2:] - gt_win[:, 2:]) ** 2)),
                 "mean_pos_err_l2": float(np.mean(pos_err_curve)),
                 "max_pos_err_l2": float(np.max(pos_err_curve)),
+                "final_pos_err_l2": final_pos_err,
+                "final_state_err_l2": final_state_err,
             }
             axs_cmp[0].plot(x_axis, pred_win[:, 0], lw=1.3, alpha=0.9, label=f"pred@a={a}({args.anchor_source})")
             axs_cmp[1].plot(x_axis, pred_win[:, 1], lw=1.3, alpha=0.9, label=f"pred@a={a}({args.anchor_source})")
@@ -471,6 +481,32 @@ def run_single_ic_eval(
         plt.tight_layout()
         plt.savefig(err_band_plot, dpi=140)
         plt.close(fig_band)
+        final_hist_plot = out_dir / "single_ic_anchor_finalstep_pos_error_hist.png"
+        fig_hist, ax_hist = plt.subplots(figsize=(7, 4))
+        if final_pos_errs:
+            bins = min(20, max(5, len(final_pos_errs) // 2))
+            ax_hist.hist(np.asarray(final_pos_errs, dtype=np.float32), bins=bins, alpha=0.8)
+        ax_hist.set_xlabel(f"||pos_pred - pos_true|| at step {we}")
+        ax_hist.set_ylabel("count")
+        ax_hist.set_title("Final-step position error distribution across anchors")
+        ax_hist.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(final_hist_plot, dpi=140)
+        plt.close(fig_hist)
+        final_scatter_plot = out_dir / "single_ic_anchor_finalstep_pos_error_vs_anchor.png"
+        fig_sc, ax_sc = plt.subplots(figsize=(8, 4))
+        if final_pos_errs:
+            ax_sc.scatter(final_anchor_steps, final_pos_errs, s=30, alpha=0.9, label="final pos err")
+            ax_sc.plot(final_anchor_steps, final_pos_errs, alpha=0.7)
+        ax_sc.set_xlabel("anchor step")
+        ax_sc.set_ylabel(f"||pos_pred - pos_true|| at step {we}")
+        ax_sc.set_title("Final-step position error vs anchor step")
+        ax_sc.grid(True, alpha=0.3)
+        if final_pos_errs:
+            ax_sc.legend(loc="best", fontsize=8)
+        plt.tight_layout()
+        plt.savefig(final_scatter_plot, dpi=140)
+        plt.close(fig_sc)
         anchor_compare_payload = {
             "window_start": ws,
             "window_end": we,
@@ -479,6 +515,17 @@ def run_single_ic_eval(
             "plot": cmp_plot.name,
             "error_plot": err_plot.name,
             "error_mean_std_plot": err_band_plot.name,
+            "finalstep_error_hist_plot": final_hist_plot.name,
+            "finalstep_error_vs_anchor_plot": final_scatter_plot.name,
+            "finalstep_anchor_steps": [int(x) for x in final_anchor_steps],
+            "finalstep_pos_errors_l2": [float(x) for x in final_pos_errs],
+            "finalstep_state_errors_l2": [float(x) for x in final_state_errs],
+            "finalstep_pos_err_mean": (
+                float(np.mean(np.asarray(final_pos_errs, dtype=np.float32))) if final_pos_errs else None
+            ),
+            "finalstep_pos_err_std": (
+                float(np.std(np.asarray(final_pos_errs, dtype=np.float32))) if final_pos_errs else None
+            ),
         }
 
     # Save overlay video and compact diagnostics.
