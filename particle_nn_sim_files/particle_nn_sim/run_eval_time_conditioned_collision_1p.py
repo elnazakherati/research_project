@@ -381,6 +381,8 @@ def run_single_ic_eval(
         we = max(ws, min(we, max_step))
         gt_win = true_state[ws : we + 1].astype(np.float32)
         anchor_results: dict[str, Any] = {}
+        err_curves: list[np.ndarray] = []
+        err_labels: list[str] = []
         fig_cmp, axs_cmp = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
         x_axis = np.arange(ws, we + 1, dtype=np.int64)
         axs_cmp[0].plot(x_axis, gt_win[:, 0], lw=2, label="GT x")
@@ -401,10 +403,15 @@ def run_single_ic_eval(
                 y_std=y_std,
                 device=device,
             )
+            pos_err_curve = np.linalg.norm(pred_win[:, :2] - gt_win[:, :2], axis=1).astype(np.float32)
+            err_curves.append(pos_err_curve)
+            err_labels.append(f"a={a} ({args.anchor_source})")
             anchor_results[str(a)] = {
                 "state_mse": float(np.mean((pred_win - gt_win) ** 2)),
                 "position_mse": float(np.mean((pred_win[:, :2] - gt_win[:, :2]) ** 2)),
                 "velocity_mse": float(np.mean((pred_win[:, 2:] - gt_win[:, 2:]) ** 2)),
+                "mean_pos_err_l2": float(np.mean(pos_err_curve)),
+                "max_pos_err_l2": float(np.max(pos_err_curve)),
             }
             axs_cmp[0].plot(x_axis, pred_win[:, 0], lw=1.3, alpha=0.9, label=f"pred@a={a}({args.anchor_source})")
             axs_cmp[1].plot(x_axis, pred_win[:, 1], lw=1.3, alpha=0.9, label=f"pred@a={a}({args.anchor_source})")
@@ -436,12 +443,42 @@ def run_single_ic_eval(
         cmp_plot = out_dir / "single_ic_anchor_window_compare.png"
         plt.savefig(cmp_plot, dpi=140)
         plt.close(fig_cmp)
+        err_plot = out_dir / "single_ic_anchor_window_pos_error_vs_step.png"
+        fig_err, ax_err = plt.subplots(figsize=(8, 4))
+        for c, lbl in zip(err_curves, err_labels):
+            ax_err.plot(x_axis, c, lw=1.5, alpha=0.9, label=lbl)
+        ax_err.set_xlabel("global step")
+        ax_err.set_ylabel("||pos_pred - pos_true||")
+        ax_err.set_title("Position error vs step across anchors")
+        ax_err.grid(True, alpha=0.3)
+        ax_err.legend(loc="best", fontsize=8)
+        plt.tight_layout()
+        plt.savefig(err_plot, dpi=140)
+        plt.close(fig_err)
+        err_band_plot = out_dir / "single_ic_anchor_window_pos_error_mean_std.png"
+        fig_band, ax_band = plt.subplots(figsize=(8, 4))
+        if err_curves:
+            err_mat = np.stack(err_curves, axis=0)
+            err_mean = np.mean(err_mat, axis=0)
+            err_std = np.std(err_mat, axis=0)
+            ax_band.plot(x_axis, err_mean, lw=2, label="mean pos error")
+            ax_band.fill_between(x_axis, err_mean - err_std, err_mean + err_std, alpha=0.25, label="±1 std")
+        ax_band.set_xlabel("global step")
+        ax_band.set_ylabel("||pos_pred - pos_true||")
+        ax_band.set_title("Position error mean ± std across anchors")
+        ax_band.grid(True, alpha=0.3)
+        ax_band.legend(loc="best", fontsize=8)
+        plt.tight_layout()
+        plt.savefig(err_band_plot, dpi=140)
+        plt.close(fig_band)
         anchor_compare_payload = {
             "window_start": ws,
             "window_end": we,
             "anchor_source": str(args.anchor_source),
             "anchors": anchor_results,
             "plot": cmp_plot.name,
+            "error_plot": err_plot.name,
+            "error_mean_std_plot": err_band_plot.name,
         }
 
     # Save overlay video and compact diagnostics.
