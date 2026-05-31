@@ -1,0 +1,48 @@
+{
+  "split": "test",
+  "num_episodes": 2,
+  "rollout_steps": 2000,
+  "chunk_mode": false,
+  "chunk_steps": 0,
+  "num_chunks": 0,
+  "chunk_anchor_mode": "pred",
+  "renorm_speed": 0.0,
+  "divergence_threshold": 0.05,
+  "ttf_median": 2000.0,
+  "ttf_p10": 2000.0,
+  "divergence_rate": 0.0,
+  "state_mse": NaN,
+  "position_mse": 6.893814861541614e-05,
+  "velocity_mse": NaN,
+  "plateau_velocity_mse": NaN,
+  "rows": [
+    {
+      "episode_idx_global": 18432,
+      "mean_err": 0.013937718234956264,
+      "max_err": 0.027405666187405586,
+      "final_err": 0.015728136524558067,
+      "diverged": false,
+      "divergence_step": 2000,
+      "video_side_by_side": "test_ep_18432_gt_vs_pred_1p.mp4",
+      "video_overlay": "test_ep_18432_gt_vs_pred_overlay_1p.mp4",
+      "error_event_plot": "test_ep_18432_error_and_event.png",
+      "state_event_plot": "test_ep_18432_state_and_event.png"
+    },
+    {
+      "episode_idx_global": 18433,
+      "mean_err": 0.008925823494791985,
+      "max_err": 0.015672598034143448,
+      "final_err": 0.008688608184456825,
+      "diverged": false,
+      "divergence_step": 2000,
+      "video_side_by_side": "test_ep_18433_gt_vs_pred_1p.mp4",
+      "video_overlay": "test_ep_18433_gt_vs_pred_overlay_1p.mp4",
+      "error_event_plot": "test_ep_18433_error_and_event.png",
+      "state_event_plot": "test_ep_18433_state_and_event.png"
+    }
+  ],
+  "best_epoch": 1997,
+  "best_val_state_mse": NaN,
+  "report_renorm_velocity": false,
+  "report_renorm_speed": 0.5
+}

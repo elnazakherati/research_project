@@ -132,7 +132,7 @@ def main():
     radius = float(np.asarray(meta["radii"], dtype=np.float32)[0])
     mass = float(np.asarray(meta["masses"], dtype=np.float32)[0])
     restitution = float(meta["restitution"])
-    wall_mode = str(cfg.get("wall_collision_mode", meta.get("wall_mode", "clamp")))
+    wall_mode = str(cfg.get("wall_collision_mode", meta.get("wall_mode", "exact")))
 
     split_indices = ckpt.get("split_indices", None)
     episode_init = ckpt.get("episode_init", None)

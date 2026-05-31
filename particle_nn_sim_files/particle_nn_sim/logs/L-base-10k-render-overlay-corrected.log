@@ -1,0 +1,8 @@
+[2026-05-14T05:23:59+00:00] rendering corrected L-base 10k overlay-only from cached NPZ test set
+[1/3] ep=18432 mean_err=0.006335 max_err=0.055305 final_err=0.012069
+[2/3] ep=18433 mean_err=0.008545 max_err=0.065398 final_err=0.010157
+[3/3] ep=18434 mean_err=0.006676 max_err=0.056910 final_err=0.003723
+Done.
+Output dir: results/L_base_10k_overlay_test3_10000steps_npz_corrected
+Summary: results/L_base_10k_overlay_test3_10000steps_npz_corrected/overlay_summary.json
+[2026-05-14T05:27:32+00:00] corrected cached NPZ overlay render complete

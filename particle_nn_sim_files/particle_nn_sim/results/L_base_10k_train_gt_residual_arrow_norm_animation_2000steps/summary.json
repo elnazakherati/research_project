@@ -1,0 +1,16 @@
+{
+  "dataset": "datasets/simple_tcno_stratified_1p_10000steps_10x.npz",
+  "episode_idx_global": 0,
+  "split": "train",
+  "steps": 2000,
+  "frame_stride": 5,
+  "dt": 0.01,
+  "initial_position": [
+    0.69475257396698,
+    0.867523193359375
+  ],
+  "max_residual_norm": 1.0529788732528687,
+  "final_residual_norm": 0.33344852924346924,
+  "video": "train_ep_00000_gt_residual_arrow_norm_0_2000_stride5.mp4",
+  "frames": 401
+}

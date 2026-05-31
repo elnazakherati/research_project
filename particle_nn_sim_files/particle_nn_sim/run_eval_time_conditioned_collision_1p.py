@@ -45,6 +45,10 @@ def resolve_device(flag: str) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def clean_scalar_time(value: float) -> float:
+    return float(round(float(value), 8))
+
+
 def infer_collision_steps_from_velocity(vel_ep: np.ndarray) -> np.ndarray:
     vx_prev = vel_ep[:-1, 0, 0]
     vx_now = vel_ep[1:, 0, 0]
@@ -180,7 +184,7 @@ def parse_args() -> argparse.Namespace:
             "'nnref' = GT is re-simulated from NN boundary state at each chunk."
         ),
     )
-    p.add_argument("--divergence-threshold", type=float, default=0.3)
+    p.add_argument("--divergence-threshold", type=float, default=0.1)
     p.add_argument("--event-prob-threshold", type=float, default=0.5)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--no-render", type=str2bool, default=False)
@@ -273,9 +277,22 @@ def _predict_window_from_anchor(
         tq_t = torch.from_numpy(t_query).to(device)
         out = model(s0_t, tq_t)
         pred = out["state"].cpu().numpy().astype(np.float32)
-        if y_mean is not None and y_std is not None:
-            pred = (pred * y_std + y_mean).astype(np.float32)
+        pred = unstandardize_model_output(pred, y_mean, y_std)
     return pred
+
+
+def event_logits_to_prob(evt_logit_np: np.ndarray | None, T: int) -> np.ndarray:
+    """Return event probabilities, or NaNs when the checkpoint has no event head."""
+    if evt_logit_np is None:
+        return np.full((int(T),), np.nan, dtype=np.float32)
+    return (1.0 / (1.0 + np.exp(-np.clip(evt_logit_np, -60.0, 60.0)))).astype(np.float32)
+
+
+def unstandardize_model_output(pred: np.ndarray, y_mean: np.ndarray | None, y_std: np.ndarray | None) -> np.ndarray:
+    if y_mean is None or y_std is None:
+        return pred.astype(np.float32)
+    d = int(pred.shape[1])
+    return (pred * y_std.reshape(1, -1)[:, :d] + y_mean.reshape(1, -1)[:, :d]).astype(np.float32)
 
 
 def run_single_ic_eval(
@@ -323,20 +340,28 @@ def run_single_ic_eval(
                 tq_t = torch.from_numpy(t_query_chunk).to(device)
                 out = model(s0_t, tq_t)
                 pred_chunk = out["state"].cpu().numpy().astype(np.float32)
-                if y_mean is not None and y_std is not None:
-                    pred_chunk = (pred_chunk * y_std + y_mean).astype(np.float32)
-                evt_chunk = out["event_logit"].squeeze(1).cpu().numpy().astype(np.float32)
+                pred_chunk = unstandardize_model_output(pred_chunk, y_mean, y_std)
+                evt_chunk = (
+                    None
+                    if out["event_logit"] is None
+                    else out["event_logit"].squeeze(1).cpu().numpy().astype(np.float32)
+                )
                 pred_chunks.append(pred_chunk)
-                evt_chunks.append(evt_chunk)
+                if evt_chunk is not None:
+                    evt_chunks.append(evt_chunk)
 
                 s0_chunk = pred_chunk[-1].copy()
                 if args.renorm_speed > 0.0:
                     s0_chunk = renormalize_velocity_in_state(s0_chunk, float(args.renorm_speed))
 
         pred_no_t0 = np.concatenate(pred_chunks, axis=0).astype(np.float32)
-        evt_no_t0 = np.concatenate(evt_chunks, axis=0).astype(np.float32)
+        evt_no_t0 = np.concatenate(evt_chunks, axis=0).astype(np.float32) if evt_chunks else None
         pred_state = np.concatenate([s0[None, :], pred_no_t0], axis=0).astype(np.float32)
-        evt_logit_np = np.concatenate([np.array([evt_no_t0[0]], dtype=np.float32), evt_no_t0], axis=0).astype(np.float32)
+        evt_logit_np = (
+            None
+            if evt_no_t0 is None
+            else np.concatenate([np.array([evt_no_t0[0]], dtype=np.float32), evt_no_t0], axis=0).astype(np.float32)
+        )
     else:
         T = int(rollout_steps + 1)  # include t=0
         t_query = (np.arange(T, dtype=np.float32) * float(dt)).astype(np.float32)
@@ -349,12 +374,15 @@ def run_single_ic_eval(
             tq_t = torch.from_numpy(t_query).to(device)
             out = model(s0_t, tq_t)
             pred_state = out["state"].cpu().numpy().astype(np.float32)
-            if y_mean is not None and y_std is not None:
-                pred_state = (pred_state * y_std + y_mean).astype(np.float32)
-            evt_logit_np = out["event_logit"].squeeze(1).cpu().numpy().astype(np.float32)
+            pred_state = unstandardize_model_output(pred_state, y_mean, y_std)
+            evt_logit_np = (
+                None
+                if out["event_logit"] is None
+                else out["event_logit"].squeeze(1).cpu().numpy().astype(np.float32)
+            )
 
     T = pred_state.shape[0]
-    evt_prob = 1.0 / (1.0 + np.exp(-np.clip(evt_logit_np, -60.0, 60.0)))
+    evt_prob = event_logits_to_prob(evt_logit_np, T)
     pred_state_renorm = (
         renormalize_velocity_batch(pred_state, float(args.report_renorm_speed))
         if args.report_renorm_velocity
@@ -802,14 +830,17 @@ def main() -> None:
     train_cfg = cfg["train"]
     split_indices = ckpt["split_indices"]
     model_cfg_raw = ckpt["model_config"]
-    default_time_max = float(data_cfg.get("dt", 0.01)) * float(data_cfg.get("steps", 700))
+    default_time_max = clean_scalar_time(data_cfg.get("dt", 0.01)) * float(data_cfg.get("steps", 700))
     model_cfg = TimeConditionedCollisionModelConfig(
         state_dim=int(model_cfg_raw["state_dim"]),
+        output_mode=str(model_cfg_raw.get("output_mode", "state")),
         trunk_width=int(model_cfg_raw["trunk_width"]),
         trunk_depth=int(model_cfg_raw["trunk_depth"]),
         activation=str(model_cfg_raw["activation"]),
         dropout=float(model_cfg_raw["dropout"]),
         enforce_t0_anchor=bool(model_cfg_raw.get("enforce_t0_anchor", True)),
+        use_event_head=bool(model_cfg_raw.get("use_event_head", True)),
+        use_endpoint_velocity_head=bool(model_cfg_raw.get("use_endpoint_velocity_head", False)),
         time_encoding=TimeEncodingConfig(
             mode=str(model_cfg_raw.get("time_encoding_mode", "fourier")),
             num_frequencies=int(model_cfg_raw.get("num_frequencies", 8)),
@@ -823,6 +854,7 @@ def main() -> None:
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
     model.eval()
+    output_mode = str(model_cfg_raw.get("output_mode", "state"))
 
     # Regenerate episodes to recover full trajectories for split eval.
     radius_eff = float(data_cfg.get("radius", 0.0))
@@ -834,7 +866,7 @@ def main() -> None:
         masses=[float(data_cfg.get("mass", 1.0))],
         restitution=1.0,
         seed=int(train_cfg.get("seed", 0)),
-        wall_mode=str(data_cfg.get("wall_collision_mode", "clamp")),
+        wall_mode=str(data_cfg.get("wall_collision_mode", "exact")),
     )
     pos_all, vel_all, coll_all, meta = collect_episodes_1p(
         sim,
@@ -884,14 +916,18 @@ def main() -> None:
     rollout_steps = int(data_cfg["steps"]) if args.rollout_steps < 0 else int(args.rollout_steps)
     if chunk_mode:
         rollout_steps = int(args.chunk_steps) * int(args.num_chunks)
+    if output_mode == "position" and chunk_mode:
+        raise ValueError("Chunked rollout requires full-state output because it reuses predicted velocity.")
+    if output_mode == "position" and args.anchor_source == "pred" and args.anchor_steps.strip():
+        raise ValueError("Predicted-anchor comparison requires full-state output.")
 
-    dt = float(meta["dt"])
+    dt = clean_scalar_time(meta["dt"])
     radius = float(np.asarray(meta["radii"], dtype=np.float32)[0])
     W = float(meta["W"])
     H = float(meta["H"])
     mass = float(np.asarray(meta["masses"], dtype=np.float32)[0])
     restitution = float(meta["restitution"])
-    wall_mode = str(data_cfg.get("wall_collision_mode", meta.get("wall_mode", "clamp")))
+    wall_mode = str(data_cfg.get("wall_collision_mode", meta.get("wall_mode", "exact")))
 
     s0_std_state = ckpt.get("s0_standardizer", None)
     y_std_state = ckpt.get("state_standardizer", None)
@@ -902,6 +938,14 @@ def main() -> None:
     if y_std_state is not None:
         y_mean = np.asarray(y_std_state["mean"], dtype=np.float32)
         y_std = np.asarray(y_std_state["std"], dtype=np.float32)
+    if bool(model_cfg.enforce_t0_anchor) and s0_mean is not None and s0_std is not None and y_mean is not None and y_std is not None:
+        out_dim = 2 if output_mode == "position" else 4
+        anchor_scale = torch.as_tensor(s0_std.reshape(4)[:out_dim] / y_std.reshape(4)[:out_dim], dtype=torch.float32)
+        anchor_bias = torch.as_tensor(
+            (s0_mean.reshape(4)[:out_dim] - y_mean.reshape(4)[:out_dim]) / y_std.reshape(4)[:out_dim],
+            dtype=torch.float32,
+        )
+        model.set_s0_anchor_affine(anchor_scale, anchor_bias)
 
     if args.single_ic:
         run_single_ic_eval(
@@ -983,11 +1027,11 @@ def main() -> None:
                     out = model(s0_t, tq_t)
 
                     pred_state_chunk = out["state"].cpu().numpy().astype(np.float32)
-                    if y_mean is not None and y_std is not None:
-                        pred_state_chunk = (pred_state_chunk * y_std + y_mean).astype(np.float32)
+                    pred_state_chunk = unstandardize_model_output(pred_state_chunk, y_mean, y_std)
                     pred_chunks.append(pred_state_chunk)
 
-                    logit_chunks.append(out["event_logit"].squeeze(1).cpu().numpy().astype(np.float32))
+                    if out["event_logit"] is not None:
+                        logit_chunks.append(out["event_logit"].squeeze(1).cpu().numpy().astype(np.float32))
                     # Re-seed next chunk using requested anchor mode.
                     if args.chunk_anchor_mode == "gt":
                         # Boundary after this chunk in the full GT trajectory.
@@ -999,7 +1043,7 @@ def main() -> None:
                             s0_chunk = renormalize_velocity_in_state(s0_chunk, float(args.renorm_speed))
 
             pred_state = np.concatenate(pred_chunks, axis=0)
-            evt_logit_np = np.concatenate(logit_chunks, axis=0)
+            evt_logit_np = np.concatenate(logit_chunks, axis=0) if logit_chunks else None
             if args.chunk_anchor_mode == "nnref":
                 # Re-simulate GT chunk-by-chunk from NN boundary states.
                 s0_ref = s0.copy()
@@ -1037,9 +1081,12 @@ def main() -> None:
                 tq_t = torch.from_numpy(t_query).to(device)
                 out = model(s0_t, tq_t)
                 pred_state = out["state"].cpu().numpy().astype(np.float32)
-                if y_mean is not None and y_std is not None:
-                    pred_state = (pred_state * y_std + y_mean).astype(np.float32)
-                evt_logit_np = out["event_logit"].squeeze(1).cpu().numpy().astype(np.float32)
+                pred_state = unstandardize_model_output(pred_state, y_mean, y_std)
+                evt_logit_np = (
+                    None
+                    if out["event_logit"] is None
+                    else out["event_logit"].squeeze(1).cpu().numpy().astype(np.float32)
+                )
             true_state = np.concatenate([pos_true[:, 0, :], vel_true[:, 0, :]], axis=1).astype(np.float32)
             true_state_full = true_state
             pred_state_full = pred_state
@@ -1070,7 +1117,7 @@ def main() -> None:
         true_pos = true_state[:, :2].reshape(T, 1, 2).astype(np.float32)
         pred_state_renorm = (
             renormalize_velocity_batch(pred_state, float(args.report_renorm_speed))
-            if args.report_renorm_velocity
+            if args.report_renorm_velocity and pred_state.shape[1] >= 4
             else None
         )
         pos_err = np.linalg.norm(true_pos[:, 0, :] - pred_pos[:, 0, :], axis=1)
@@ -1119,7 +1166,11 @@ def main() -> None:
                 )
                 mse_state = float(np.mean((pred_win - gt_win) ** 2))
                 mse_pos = float(np.mean((pred_win[:, :2] - gt_win[:, :2]) ** 2))
-                mse_vel = float(np.mean((pred_win[:, 2:] - gt_win[:, 2:]) ** 2))
+                mse_vel = (
+                    float(np.mean((pred_win[:, 2:] - gt_win[:, 2:]) ** 2))
+                    if pred_win.shape[1] >= 4
+                    else float("nan")
+                )
                 anchor_results[str(a)] = {
                     "state_mse": mse_state,
                     "position_mse": mse_pos,
@@ -1206,7 +1257,7 @@ def main() -> None:
             axs[0].plot(np.arange(T), pos_err, lw=2, color="tab:red")
             axs[0].set_ylabel("||x_pred-x_true||")
             axs[0].grid(True, alpha=0.3)
-            evt_prob = 1.0 / (1.0 + np.exp(-np.clip(evt_logit_np, -60.0, 60.0)))
+            evt_prob = event_logits_to_prob(evt_logit_np, T)
             axs[1].plot(np.arange(T), evt_prob, lw=2, label="pred p(event)")
             axs[1].plot(np.arange(T), evt_true, lw=1.5, alpha=0.75, label="target event")
             axs[1].set_ylabel("event")
@@ -1234,7 +1285,8 @@ def main() -> None:
             axs_state[1].grid(True, alpha=0.3)
 
             axs_state[2].plot(np.arange(T), true_state[:, 2], lw=2, label="true")
-            axs_state[2].plot(np.arange(T), pred_state[:, 2], lw=1.8, alpha=0.9, label="pred")
+            if pred_state.shape[1] >= 4:
+                axs_state[2].plot(np.arange(T), pred_state[:, 2], lw=1.8, alpha=0.9, label="pred")
             if pred_state_renorm is not None:
                 axs_state[2].plot(np.arange(T), pred_state_renorm[:, 2], lw=1.2, ls="--", alpha=0.9, label="pred_renorm")
             axs_state[2].set_ylabel("vx(t)")
@@ -1242,7 +1294,8 @@ def main() -> None:
             axs_state[2].grid(True, alpha=0.3)
 
             axs_state[3].plot(np.arange(T), true_state[:, 3], lw=2, label="true")
-            axs_state[3].plot(np.arange(T), pred_state[:, 3], lw=1.8, alpha=0.9, label="pred")
+            if pred_state.shape[1] >= 4:
+                axs_state[3].plot(np.arange(T), pred_state[:, 3], lw=1.8, alpha=0.9, label="pred")
             if pred_state_renorm is not None:
                 axs_state[3].plot(np.arange(T), pred_state_renorm[:, 3], lw=1.2, ls="--", alpha=0.9, label="pred_renorm")
             axs_state[3].set_ylabel("vy(t)")
@@ -1283,13 +1336,21 @@ def main() -> None:
     true_all = np.concatenate(all_true_state, axis=0)
     evt_all = np.concatenate(all_evt_true, axis=0)
 
-    state_mse = float(np.mean((pred_all - true_all) ** 2))
+    state_mse = (
+        float(np.mean((pred_all - true_all) ** 2))
+        if pred_all.shape[1] == true_all.shape[1]
+        else float("nan")
+    )
     pos_mse = float(np.mean((pred_all[:, :2] - true_all[:, :2]) ** 2))
-    vel_mse = float(np.mean((pred_all[:, 2:] - true_all[:, 2:]) ** 2))
+    vel_mse = (
+        float(np.mean((pred_all[:, 2:] - true_all[:, 2:]) ** 2))
+        if pred_all.shape[1] >= 4
+        else float("nan")
+    )
     plateau_mask = evt_all < float(args.plateau_event_threshold)
     plateau_vel_mse = (
         float(np.mean((pred_all[plateau_mask, 2:] - true_all[plateau_mask, 2:]) ** 2))
-        if np.any(plateau_mask)
+        if np.any(plateau_mask) and pred_all.shape[1] >= 4
         else vel_mse
     )
     div_steps = np.array([r["divergence_step"] for r in rows], dtype=np.float64)

@@ -1,0 +1,52 @@
+{
+  "checkpoint": "checkpoints/simple_tcno_1p_exact_L_base_10000steps_10x_raw_gaussian_noeventhead_w256_d5_poshead_b65536_wandb_target1e-6_gpu5/model_tc_collision_1p.pt",
+  "dataset": "datasets/simple_tcno_stratified_1p_10000steps_10x.npz",
+  "split": "test",
+  "rollout_steps": 10000,
+  "frame_stride": 10,
+  "fps": 50,
+  "rows": [
+    {
+      "episode_idx_global": 18432,
+      "mean_pos_err": 0.00633477745577693,
+      "max_pos_err": 0.05530481040477753,
+      "final_pos_err": 0.012069282121956348,
+      "initial_state": [
+        0.246043398976326,
+        0.9677377343177795,
+        0.030740538612008095,
+        0.4990541338920593
+      ],
+      "video_overlay": "test_ep_18432_gt_vs_pred_overlay_1p.mp4"
+    },
+    {
+      "episode_idx_global": 18433,
+      "mean_pos_err": 0.008545042015612125,
+      "max_pos_err": 0.06539762765169144,
+      "final_pos_err": 0.010156805627048016,
+      "initial_state": [
+        0.7717698216438293,
+        0.11087493598461151,
+        0.38922202587127686,
+        0.31385698914527893
+      ],
+      "video_overlay": "test_ep_18433_gt_vs_pred_overlay_1p.mp4"
+    },
+    {
+      "episode_idx_global": 18434,
+      "mean_pos_err": 0.00667597446590662,
+      "max_pos_err": 0.05690993368625641,
+      "final_pos_err": 0.0037230332382023335,
+      "initial_state": [
+        0.9145968556404114,
+        0.1109585165977478,
+        -0.03574581816792488,
+        -0.49872058629989624
+      ],
+      "video_overlay": "test_ep_18434_gt_vs_pred_overlay_1p.mp4"
+    }
+  ],
+  "mean_pos_err": 0.007185264645765225,
+  "max_pos_err": 0.06539762765169144,
+  "final_pos_err_mean": 0.008649706995735565
+}

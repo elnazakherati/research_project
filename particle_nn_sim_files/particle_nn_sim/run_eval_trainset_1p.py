@@ -65,7 +65,7 @@ def parse_args():
 
 
 def get_wall_mode(cfg, meta):
-    return str(cfg.get("wall_collision_mode", meta.get("wall_mode", "clamp")))
+    return str(cfg.get("wall_collision_mode", meta.get("wall_mode", "exact")))
 
 
 def main():

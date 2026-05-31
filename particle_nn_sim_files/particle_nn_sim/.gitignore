@@ -1,0 +1,19 @@
+# Local generated artifacts for this package.
+__pycache__/
+*.py[cod]
+
+# Experiment outputs.
+checkpoints/
+datasets/
+wandb/
+
+# Large model/visual artifacts.
+*.pt
+*.pth
+*.ckpt
+*.mp4
+*.gif
+*.png
+
+# Notebook/runtime detritus.
+.ipynb_checkpoints/

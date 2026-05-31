@@ -83,8 +83,8 @@ def parse_args():
     p.add_argument(
         "--wall-collision-mode",
         type=str,
-        default="clamp",
-        choices=["clamp", "exact"],
+        default="exact",
+        choices=["exact"],
         help="Ground-truth wall handling mode for simulator-generated trajectories.",
     )
 

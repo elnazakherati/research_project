@@ -1,0 +1,19 @@
+[2026-05-13T03:35:34+00:00] retrying L base 10k training with sampled epochs to avoid full-randperm OOM
+Device: cuda
+Dataset: datasets/simple_tcno_stratified_1p_10000steps_10x.npz
+Shapes: pos=(20480, 10001, 1, 2), vel=(20480, 10001, 1, 2), coll=(20480, 10000)
+Splits: train=16384, val=2048, test=2048
+Materialized train samples on cuda: 163856384
+Samples per epoch: 8388608
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/shawheen/.netrc.
+wandb: Currently logged in as: synaderi (synaderi-uc-davis) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run sgqxnsu4
+wandb: Tracking run with wandb version 0.25.1
+wandb: Run data is saved locally in /home/shawheen/research_project/particle_nn_sim_files/particle_nn_sim/wandb/run-20260513_033732-sgqxnsu4
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run L-base-10k-retry
+wandb: ⭐️ View project at https://wandb.ai/synaderi-uc-davis/particle-nn-sim
+wandb: 🚀 View run at https://wandb.ai/synaderi-uc-davis/particle-nn-sim/runs/sgqxnsu4
+Epoch 001 | train_loss=1.022130 | train_mse=1.022130 | train_speed_mse=0.000000 | train_endpoint_vel_mse=nan | train_event_bce=nan | val_loss=0.902945 | val_mse=0.902945 | val_speed_mse=0.000000 | val_vel_mse_sup=0.000000 | val_endpoint_vel_mse=nan | val_event_bce=nan | val_event_acc=nan | best_epoch=1 | lr=1.00e-03 | sec=8.42
+Epoch 025 | train_loss=0.811042 | train_mse=0.811042 | train_speed_mse=0.000000 | train_endpoint_vel_mse=nan | train_event_bce=nan | val_loss=0.808735 | val_mse=0.808735 | val_speed_mse=0.000000 | val_vel_mse_sup=0.000000 | val_endpoint_vel_mse=nan | val_event_bce=nan | val_event_acc=nan | best_epoch=22 | lr=1.00e-03 | sec=7.86
+Epoch 050 | train_loss=0.750535 | train_mse=0.750535 | train_speed_mse=0.000000 | train_endpoint_vel_mse=nan | train_event_bce=nan | val_loss=0.750437 | val_mse=0.750437 | val_speed_mse=0.000000 | val_vel_mse_sup=0.000000 | val_endpoint_vel_mse=nan | val_event_bce=nan | val_event_acc=nan | best_epoch=50 | lr=1.00e-03 | sec=8.09

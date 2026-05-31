@@ -18,7 +18,7 @@ class ParticleSim2D:
         masses=None,
         restitution=1.0,
         seed=0,
-        wall_mode="clamp",
+        wall_mode="exact",
         exact_max_events=16,
     ):
         self.W = float(W)

@@ -299,7 +299,7 @@ def collect_episodes_1p(
         "radii": sim.radii.astype(np.float32),
         "masses": sim.masses.astype(np.float32),
         "restitution": np.float32(sim.restitution),
-        "wall_mode": str(getattr(sim, "wall_mode", "clamp")),
+        "wall_mode": str(getattr(sim, "wall_mode", "exact")),
         "stratified_init": bool(stratified_init),
         "pos_grid_n": int(pos_grid_n),
         "angle_bins": int(angle_bins),

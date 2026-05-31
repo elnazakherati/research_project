@@ -60,6 +60,7 @@ class TrainConfig:
 
 @dataclass
 class DataConfig:
+    dataset: str | None = None
     episodes: int = 1000
     steps: int = 700
     dt: float = 0.01
@@ -67,7 +68,7 @@ class DataConfig:
     fixed_speed: float | None = None
     radius: float = 0.0
     mass: float = 1.0
-    wall_collision_mode: str = "clamp"
+    wall_collision_mode: str = "exact"
     coll_epsilon_steps: int = 2
     event_target_mode: str = "gaussian"  # {"window","gaussian"}
     event_window: float = 0.04
@@ -255,6 +256,39 @@ def build_event_targets(
         return np.clip(labels, 0.0, 1.0).astype(np.float32)
 
     raise ValueError(f"Unsupported event_target_mode: {mode}")
+
+
+def load_cached_dataset(
+    path: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any], dict[str, Any], dict[str, np.ndarray]]:
+    data_path = Path(path)
+    if not data_path.exists():
+        raise FileNotFoundError(f"Dataset not found: {data_path}")
+
+    with np.load(data_path, allow_pickle=False) as data:
+        pos_all = data["pos_all"].astype(np.float32)
+        vel_all = data["vel_all"].astype(np.float32)
+        coll_all = data["coll_all"].astype(np.uint8)
+        meta = json.loads(str(data["meta_json"])) if "meta_json" in data.files else {}
+        generation_config = (
+            json.loads(str(data["generation_config"])) if "generation_config" in data.files else {}
+        )
+        split_indices = {
+            key: data[key].astype(np.int64)
+            for key in ("train_eps", "val_eps", "test_eps")
+            if key in data.files
+        }
+
+    meta.setdefault("W", 1.0)
+    meta.setdefault("H", 1.0)
+    meta.setdefault("dt", float(generation_config.get("dt", 0.01)))
+    radius = float(generation_config.get("radius", 0.0))
+    radius_eff = float(generation_config.get("radius_eff", radius if radius > 0.0 else 1e-6))
+    meta.setdefault("radii", [radius_eff])
+    meta.setdefault("masses", [float(generation_config.get("mass", 1.0))])
+    meta.setdefault("wall_mode", str(generation_config.get("wall_collision_mode", "exact")))
+
+    return pos_all, vel_all, coll_all, meta, generation_config, split_indices
 
 
 def build_query_samples(
@@ -503,6 +537,12 @@ def make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Train pure-ML time-conditioned collision model (non-autoregressive query).")
 
     # Data.
+    p.add_argument(
+        "--dataset",
+        type=str,
+        default="",
+        help="Optional existing NPZ dataset with pos_all/vel_all/coll_all and optional saved splits.",
+    )
     p.add_argument("--episodes", type=int, default=1000)
     p.add_argument("--steps", type=int, default=700)
     p.add_argument("--dt", type=float, default=0.01)
@@ -510,7 +550,7 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--fixed-speed", type=float, default=None)
     p.add_argument("--radius", type=float, default=0.0)
     p.add_argument("--mass", type=float, default=1.0)
-    p.add_argument("--wall-collision-mode", type=str, default="clamp", choices=["clamp", "exact"])
+    p.add_argument("--wall-collision-mode", type=str, default="exact", choices=["exact"])
     p.add_argument("--coll-epsilon-steps", type=int, default=2)
     p.add_argument("--event-target-mode", type=str, default="gaussian", choices=["window", "gaussian", "spike"])
     p.add_argument("--event-window", type=float, default=0.04)
@@ -640,6 +680,7 @@ def main() -> None:
     print(f"Device: {device} ({gpu_name})")
 
     data_cfg = DataConfig(
+        dataset=str(args.dataset) if str(args.dataset).strip() else None,
         episodes=args.episodes,
         steps=args.steps,
         dt=args.dt,
@@ -708,6 +749,34 @@ def main() -> None:
         event_prob_threshold=args.event_prob_threshold,
         sign_epsilon=args.sign_epsilon,
     )
+
+    cached_dataset: tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, np.ndarray],
+    ] | None = None
+    if data_cfg.dataset is not None:
+        cached_dataset = load_cached_dataset(data_cfg.dataset)
+        pos_cached, _vel_cached, _coll_cached, meta_cached, gen_cfg_cached, split_cached = cached_dataset
+        data_cfg.episodes = int(pos_cached.shape[0])
+        data_cfg.steps = int(pos_cached.shape[1] - 1)
+        data_cfg.dt = float(meta_cached.get("dt", gen_cfg_cached.get("dt", data_cfg.dt)))
+        data_cfg.speed_max = float(gen_cfg_cached.get("speed_max", data_cfg.speed_max))
+        data_cfg.fixed_speed = gen_cfg_cached.get("fixed_speed", data_cfg.fixed_speed)
+        data_cfg.radius = float(gen_cfg_cached.get("radius", data_cfg.radius))
+        data_cfg.mass = float(gen_cfg_cached.get("mass", data_cfg.mass))
+        data_cfg.wall_collision_mode = str(gen_cfg_cached.get("wall_collision_mode", data_cfg.wall_collision_mode))
+        data_cfg.stratified_init = bool(gen_cfg_cached.get("stratified_init", data_cfg.stratified_init))
+        data_cfg.pos_grid_n = int(gen_cfg_cached.get("pos_grid_n", data_cfg.pos_grid_n))
+        data_cfg.angle_bins = int(gen_cfg_cached.get("angle_bins", data_cfg.angle_bins))
+        data_cfg.episodes_per_bucket = gen_cfg_cached.get("episodes_per_bucket", data_cfg.episodes_per_bucket)
+        if {"train_eps", "val_eps", "test_eps"}.issubset(split_cached):
+            train_cfg.train_split = float(len(split_cached["train_eps"]) / max(data_cfg.episodes, 1))
+            train_cfg.val_split = float(len(split_cached["val_eps"]) / max(data_cfg.episodes, 1))
+
     time_max = float(args.time_max) if args.time_max > 0.0 else float(data_cfg.dt) * float(data_cfg.steps)
     model_cfg = TimeConditionedCollisionModelConfig(
         state_dim=4,
@@ -788,55 +857,68 @@ def main() -> None:
             init_kwargs["name"] = args.wandb_run_name
         wandb_run = wandb.init(**init_kwargs)
 
-    # Data generation.
-    radius_eff = data_cfg.radius if data_cfg.radius > 0.0 else 1e-6
-    sim = ParticleSim2D(
-        W=1.0,
-        H=1.0,
-        radii=[radius_eff],
-        masses=[data_cfg.mass],
-        restitution=1.0,
-        seed=train_cfg.seed,
-        wall_mode=data_cfg.wall_collision_mode,
-    )
-    pos_all, vel_all, coll_all, meta = collect_episodes_1p(
-        sim,
-        E=data_cfg.episodes,
-        steps=data_cfg.steps,
-        dt=data_cfg.dt,
-        speed_max=data_cfg.speed_max,
-        seed=train_cfg.seed,
-        stratified_init=data_cfg.stratified_init,
-        pos_grid_n=data_cfg.pos_grid_n,
-        angle_bins=data_cfg.angle_bins,
-        episodes_per_bucket=data_cfg.episodes_per_bucket,
-        fixed_speed=data_cfg.fixed_speed,
-        fixed_x=data_cfg.fixed_x,
-        fixed_y=data_cfg.fixed_y,
-        fixed_vx=data_cfg.fixed_vx,
-        fixed_vy=data_cfg.fixed_vy,
-        fixed2_x=data_cfg.fixed2_x,
-        fixed2_y=data_cfg.fixed2_y,
-        fixed2_vx=data_cfg.fixed2_vx,
-        fixed2_vy=data_cfg.fixed2_vy,
-        ball_center_x=data_cfg.ball_center_x,
-        ball_center_y=data_cfg.ball_center_y,
-        ball_radius=data_cfg.ball_radius,
-        fixed_vel_vx=data_cfg.fixed_vel_vx,
-        fixed_vel_vy=data_cfg.fixed_vel_vy,
-    )
-    print(
-        f"Generated episodes: pos_all={pos_all.shape}, vel_all={vel_all.shape}, "
-        f"collision_frames={int(coll_all.sum())}/{coll_all.size}"
-    )
+    # Data loading/generation.
+    if cached_dataset is not None:
+        pos_all, vel_all, coll_all, meta, _gen_cfg, split_indices_cached = cached_dataset
+        print(
+            f"Loaded dataset: {data_cfg.dataset} | pos_all={pos_all.shape}, vel_all={vel_all.shape}, "
+            f"collision_frames={int(coll_all.sum())}/{coll_all.size}"
+        )
+    else:
+        radius_eff = data_cfg.radius if data_cfg.radius > 0.0 else 1e-6
+        sim = ParticleSim2D(
+            W=1.0,
+            H=1.0,
+            radii=[radius_eff],
+            masses=[data_cfg.mass],
+            restitution=1.0,
+            seed=train_cfg.seed,
+            wall_mode=data_cfg.wall_collision_mode,
+        )
+        pos_all, vel_all, coll_all, meta = collect_episodes_1p(
+            sim,
+            E=data_cfg.episodes,
+            steps=data_cfg.steps,
+            dt=data_cfg.dt,
+            speed_max=data_cfg.speed_max,
+            seed=train_cfg.seed,
+            stratified_init=data_cfg.stratified_init,
+            pos_grid_n=data_cfg.pos_grid_n,
+            angle_bins=data_cfg.angle_bins,
+            episodes_per_bucket=data_cfg.episodes_per_bucket,
+            fixed_speed=data_cfg.fixed_speed,
+            fixed_x=data_cfg.fixed_x,
+            fixed_y=data_cfg.fixed_y,
+            fixed_vx=data_cfg.fixed_vx,
+            fixed_vy=data_cfg.fixed_vy,
+            fixed2_x=data_cfg.fixed2_x,
+            fixed2_y=data_cfg.fixed2_y,
+            fixed2_vx=data_cfg.fixed2_vx,
+            fixed2_vy=data_cfg.fixed2_vy,
+            ball_center_x=data_cfg.ball_center_x,
+            ball_center_y=data_cfg.ball_center_y,
+            ball_radius=data_cfg.ball_radius,
+            fixed_vel_vx=data_cfg.fixed_vel_vx,
+            fixed_vel_vy=data_cfg.fixed_vel_vy,
+        )
+        split_indices_cached = {}
+        print(
+            f"Generated episodes: pos_all={pos_all.shape}, vel_all={vel_all.shape}, "
+            f"collision_frames={int(coll_all.sum())}/{coll_all.size}"
+        )
 
     E = int(pos_all.shape[0])
-    idx = np.arange(E)
-    n_train = int(train_cfg.train_split * E)
-    n_val = int(train_cfg.val_split * E)
-    train_eps = idx[:n_train]
-    val_eps = idx[n_train : n_train + n_val]
-    test_eps = idx[n_train + n_val :]
+    if {"train_eps", "val_eps", "test_eps"}.issubset(split_indices_cached):
+        train_eps = split_indices_cached["train_eps"]
+        val_eps = split_indices_cached["val_eps"]
+        test_eps = split_indices_cached["test_eps"]
+    else:
+        idx = np.arange(E)
+        n_train = int(train_cfg.train_split * E)
+        n_val = int(train_cfg.val_split * E)
+        train_eps = idx[:n_train]
+        val_eps = idx[n_train : n_train + n_val]
+        test_eps = idx[n_train + n_val :]
     if len(train_eps) == 0 or len(val_eps) == 0 or len(test_eps) == 0:
         raise ValueError("Empty split encountered. Increase episodes or adjust train/val split.")
     print(f"Episode splits: train={len(train_eps)} val={len(val_eps)} test={len(test_eps)}")

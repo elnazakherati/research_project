@@ -34,8 +34,8 @@ def parse_args():
     p.add_argument(
         "--wall-collision-mode",
         type=str,
-        default="clamp",
-        choices=["clamp", "exact"],
+        default="exact",
+        choices=["exact"],
         help="Ground-truth wall handling mode.",
     )
     p.add_argument("--seed", type=int, default=0)

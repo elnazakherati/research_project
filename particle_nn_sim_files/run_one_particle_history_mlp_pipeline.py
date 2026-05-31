@@ -203,7 +203,7 @@ def parse_args():
     p.add_argument("--fixed-speed", type=float, default=None)
     p.add_argument("--radius", type=float, default=0.0)
     p.add_argument("--mass", type=float, default=1.0)
-    p.add_argument("--wall-collision-mode", type=str, default="clamp", choices=["clamp", "exact"])
+    p.add_argument("--wall-collision-mode", type=str, default="exact", choices=["exact"])
 
     p.add_argument("--fixed-x", type=float, default=None)
     p.add_argument("--fixed-y", type=float, default=None)

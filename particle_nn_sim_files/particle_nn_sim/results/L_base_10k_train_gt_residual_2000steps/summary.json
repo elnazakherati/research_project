@@ -1,0 +1,17 @@
+{
+  "dataset": "datasets/simple_tcno_stratified_1p_10000steps_10x.npz",
+  "episode_idx_global": 0,
+  "split": "train",
+  "steps": 2000,
+  "dt": 0.01,
+  "initial_position": [
+    0.69475257396698,
+    0.867523193359375
+  ],
+  "plot": "train_ep_00000_gt_position_residual_0_2000.png",
+  "dx_min": -0.6938074231147766,
+  "dx_max": 0.30442535877227783,
+  "dy_min": -0.8671246767044067,
+  "dy_max": 0.13221383094787598,
+  "distance_max": 1.058016300201416
+}

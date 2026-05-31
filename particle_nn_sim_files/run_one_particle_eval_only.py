@@ -64,8 +64,8 @@ def parse_args():
         "--wall-collision-mode",
         type=str,
         default="auto",
-        choices=["auto", "clamp", "exact"],
-        help="Ground-truth simulator wall mode. auto uses checkpoint/meta mode when available, else clamp.",
+        choices=["auto", "exact"],
+        help="Ground-truth simulator wall mode. auto uses checkpoint/meta mode when available, else exact.",
     )
     return p.parse_args()
 
@@ -126,7 +126,7 @@ def main():
         if not (radius <= fy <= H - radius):
             raise ValueError(f"--fixed-y={fy} outside valid range [{radius}, {H-radius}]")
     if args.wall_collision_mode == "auto":
-        wall_mode = str(meta.get("wall_mode", "clamp"))
+        wall_mode = str(meta.get("wall_mode", "exact"))
     else:
         wall_mode = args.wall_collision_mode
 

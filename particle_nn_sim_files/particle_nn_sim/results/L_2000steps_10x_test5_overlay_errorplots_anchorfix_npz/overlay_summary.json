@@ -1,0 +1,84 @@
+{
+  "checkpoint": "checkpoints/simple_tcno_1p_exact_L_2000steps_10x_raw_gaussian_noeventhead_w256_d5_poshead_b65536_wandb_target1e-6/model_tc_collision_1p.pt",
+  "dataset": "datasets/simple_tcno_stratified_1p_2000steps_10x.npz",
+  "split": "test",
+  "rollout_steps": 2000,
+  "frame_stride": 10,
+  "trace_tail_steps": 0,
+  "fps": 50,
+  "rows": [
+    {
+      "episode_idx_global": 18432,
+      "mean_pos_err": 0.0009522919426672161,
+      "max_pos_err": 0.01477606687694788,
+      "final_pos_err": 0.0019355551339685917,
+      "initial_state": [
+        0.246043398976326,
+        0.9677377343177795,
+        0.030740538612008095,
+        0.4990541338920593
+      ],
+      "position_error_plot": "test_ep_18432_position_error.png",
+      "video_overlay": "test_ep_18432_gt_vs_pred_overlay_1p.mp4"
+    },
+    {
+      "episode_idx_global": 18433,
+      "mean_pos_err": 0.0010122413514181972,
+      "max_pos_err": 0.009288359433412552,
+      "final_pos_err": 0.00046289898455142975,
+      "initial_state": [
+        0.7717698216438293,
+        0.11087493598461151,
+        0.38922202587127686,
+        0.31385698914527893
+      ],
+      "position_error_plot": "test_ep_18433_position_error.png",
+      "video_overlay": "test_ep_18433_gt_vs_pred_overlay_1p.mp4"
+    },
+    {
+      "episode_idx_global": 18434,
+      "mean_pos_err": 0.0008198778377845883,
+      "max_pos_err": 0.007767879404127598,
+      "final_pos_err": 0.0003983902861364186,
+      "initial_state": [
+        0.9145968556404114,
+        0.1109585165977478,
+        -0.03574581816792488,
+        -0.49872058629989624
+      ],
+      "position_error_plot": "test_ep_18434_position_error.png",
+      "video_overlay": "test_ep_18434_gt_vs_pred_overlay_1p.mp4"
+    },
+    {
+      "episode_idx_global": 18435,
+      "mean_pos_err": 0.000959581695497036,
+      "max_pos_err": 0.007654025685042143,
+      "final_pos_err": 0.0018681003712117672,
+      "initial_state": [
+        0.16798149049282074,
+        0.1238173320889473,
+        -0.4684154689311981,
+        0.17489127814769745
+      ],
+      "position_error_plot": "test_ep_18435_position_error.png",
+      "video_overlay": "test_ep_18435_gt_vs_pred_overlay_1p.mp4"
+    },
+    {
+      "episode_idx_global": 18436,
+      "mean_pos_err": 0.000881220621522516,
+      "max_pos_err": 0.008416890166699886,
+      "final_pos_err": 0.002359899925068021,
+      "initial_state": [
+        0.5405248999595642,
+        0.25524580478668213,
+        0.4272293150424957,
+        -0.25975969433784485
+      ],
+      "position_error_plot": "test_ep_18436_position_error.png",
+      "video_overlay": "test_ep_18436_gt_vs_pred_overlay_1p.mp4"
+    }
+  ],
+  "mean_pos_err": 0.0009250426897779107,
+  "max_pos_err": 0.01477606687694788,
+  "final_pos_err_mean": 0.0014049689401872457
+}

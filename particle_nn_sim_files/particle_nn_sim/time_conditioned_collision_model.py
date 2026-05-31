@@ -84,11 +84,14 @@ class TimeConditionedCollisionModelConfig:
     """Model hyperparameters."""
 
     state_dim: int = 4  # [x0, y0, vx0, vy0]
+    output_mode: str = "state"  # {"state", "position"}
     trunk_width: int = 256
     trunk_depth: int = 3
     activation: str = "gelu"  # {"gelu", "silu"}
     dropout: float = 0.0
     enforce_t0_anchor: bool = True
+    use_event_head: bool = True
+    use_endpoint_velocity_head: bool = False
     time_encoding: TimeEncodingConfig = field(default_factory=TimeEncodingConfig)
 
 
@@ -109,6 +112,9 @@ class TimeConditionedCollisionModel(nn.Module):
     def __init__(self, cfg: TimeConditionedCollisionModelConfig):
         super().__init__()
         self.cfg = cfg
+        if cfg.output_mode not in {"state", "position"}:
+            raise ValueError(f"Unsupported output_mode: {cfg.output_mode}")
+        self.output_dim = 2 if cfg.output_mode == "position" else 4
         self.time_encoder = TimeEncoder(cfg.time_encoding)
 
         in_dim = cfg.state_dim + self.time_encoder.out_dim
@@ -126,14 +132,15 @@ class TimeConditionedCollisionModel(nn.Module):
         self.trunk = nn.Sequential(*trunk_layers)
 
         self.pos_head = nn.Linear(width, 2)
-        self.vel_head = nn.Linear(width, 2)
-        self.event_head = nn.Linear(width, 1)
+        self.vel_head = nn.Linear(width, 2) if cfg.output_mode == "state" else None
+        self.endpoint_vel_head = nn.Linear(width, 2) if cfg.use_endpoint_velocity_head else None
+        self.event_head = nn.Linear(width, 1) if cfg.use_event_head else None
 
         # Optional affine map for converting input-space s0 into output-space anchor.
         # This is useful when input and output states are normalized with different
         # standardizers: state_anchor = s0 * scale + bias.
-        self.register_buffer("s0_anchor_scale", torch.ones(1, 4), persistent=False)
-        self.register_buffer("s0_anchor_bias", torch.zeros(1, 4), persistent=False)
+        self.register_buffer("s0_anchor_scale", torch.ones(1, self.output_dim), persistent=False)
+        self.register_buffer("s0_anchor_bias", torch.zeros(1, self.output_dim), persistent=False)
 
         self._init_weights()
 
@@ -145,14 +152,14 @@ class TimeConditionedCollisionModel(nn.Module):
             scale: shape (4,) or (1,4)
             bias:  shape (4,) or (1,4)
         """
-        scale = scale.reshape(1, 4).to(dtype=self.s0_anchor_scale.dtype, device=self.s0_anchor_scale.device)
-        bias = bias.reshape(1, 4).to(dtype=self.s0_anchor_bias.dtype, device=self.s0_anchor_bias.device)
+        scale = scale.reshape(1, self.output_dim).to(dtype=self.s0_anchor_scale.dtype, device=self.s0_anchor_scale.device)
+        bias = bias.reshape(1, self.output_dim).to(dtype=self.s0_anchor_bias.dtype, device=self.s0_anchor_bias.device)
         self.s0_anchor_scale.copy_(scale)
         self.s0_anchor_bias.copy_(bias)
 
     def output_anchor_from_s0(self, s0: torch.Tensor) -> torch.Tensor:
         """Map input-space s0 to output-space anchor state."""
-        return s0 * self.s0_anchor_scale + self.s0_anchor_bias
+        return s0[:, : self.output_dim] * self.s0_anchor_scale + self.s0_anchor_bias
 
     def _init_weights(self) -> None:
         for m in self.modules():
@@ -167,9 +174,11 @@ class TimeConditionedCollisionModel(nn.Module):
             t:  (B,) or (B,1), queried time in seconds
         Returns dict with:
             pos: (B,2)
-            vel: (B,2)
+            vel: (B,2) or None when output_mode="position"
+            endpoint_vel: (B,2) or None when no endpoint velocity head is configured
             event_logit: (B,1)
-            state: (B,4) => [x(t), y(t), vx(t), vy(t)]
+            state: (B,4) => [x(t), y(t), vx(t), vy(t)] when output_mode="state"
+                   (B,2) => [x(t), y(t)] when output_mode="position"
         """
         if s0.ndim != 2 or s0.shape[1] != 4:
             raise ValueError(f"s0 must be shape (B,4), got {tuple(s0.shape)}")
@@ -184,9 +193,10 @@ class TimeConditionedCollisionModel(nn.Module):
         x = torch.cat([s0, gamma_t], dim=1)
         h = self.trunk(x)
         pos = self.pos_head(h)
-        vel = self.vel_head(h)
-        event_logit = self.event_head(h)
-        state_delta = torch.cat([pos, vel], dim=1)
+        vel = self.vel_head(h) if self.vel_head is not None else None
+        endpoint_vel = self.endpoint_vel_head(h) if self.endpoint_vel_head is not None else None
+        event_logit = self.event_head(h) if self.event_head is not None else None
+        state_delta = pos if vel is None else torch.cat([pos, vel], dim=1)
         if self.cfg.enforce_t0_anchor:
             # Reparameterization: s_hat(t) = s0_anchor + t * h_theta(s0, t)
             # This guarantees exact initial-state matching at t=0.
@@ -197,6 +207,7 @@ class TimeConditionedCollisionModel(nn.Module):
         return {
             "pos": pos,
             "vel": vel,
+            "endpoint_vel": endpoint_vel,
             "event_logit": event_logit,
             "state": state_pred,
         }

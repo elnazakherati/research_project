@@ -1,0 +1,30 @@
+{
+  "dataset": "datasets/simple_tcno_stratified_1p_10000steps_10x.npz",
+  "episode_idx_global": 0,
+  "split": "train",
+  "steps": 2000,
+  "dt": 0.01,
+  "initial_position": [
+    0.69475257396698,
+    0.867523193359375
+  ],
+  "arrow_steps": [
+    100,
+    226,
+    353,
+    480,
+    606,
+    733,
+    860,
+    986,
+    1113,
+    1240,
+    1366,
+    1493,
+    1620,
+    1746,
+    1873,
+    2000
+  ],
+  "plot": "train_ep_00000_gt_residual_vectors_on_trajectory_0_2000.png"
+}

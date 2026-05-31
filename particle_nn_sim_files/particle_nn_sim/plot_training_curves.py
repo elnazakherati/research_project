@@ -32,14 +32,14 @@ def save_curve(values, ylabel, title, out_path):
     plt.close()
 
 
-def save_train_test_overlay(train_values, test_values, out_path):
+def save_train_test_overlay(train_values, test_values, out_path, test_label="test_mse_all"):
     epochs = range(1, min(len(train_values), len(test_values)) + 1)
     plt.figure(figsize=(7, 4))
     plt.plot(epochs, train_values[: len(epochs)], lw=2, label="train_loss")
-    plt.plot(epochs, test_values[: len(epochs)], lw=2, label="test_mse_all")
+    plt.plot(epochs, test_values[: len(epochs)], lw=2, label=test_label)
     plt.xlabel("epoch")
     plt.ylabel("loss / mse")
-    plt.title("Train Loss vs Test MSE (All)")
+    plt.title(f"Train Loss vs {test_label}")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
@@ -58,8 +58,51 @@ def main():
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     hist = ckpt.get("hist", None)
+    if hist is None:
+        hist = ckpt.get("history", None)
     if not isinstance(hist, dict):
-        raise RuntimeError("Checkpoint has no 'hist' dict. Cannot plot training curves.")
+        raise RuntimeError("Checkpoint has no 'hist' or 'history' dict. Cannot plot training curves.")
+
+    if "val_state_mse" in hist:
+        required = [
+            "train_loss",
+            "train_state_mse",
+            "train_event_bce",
+            "val_loss",
+            "val_state_mse",
+            "val_event_bce",
+            "val_event_acc",
+        ]
+        for k in required:
+            if k not in hist:
+                raise RuntimeError(f"Missing history key '{k}' in checkpoint.")
+            if len(hist[k]) == 0:
+                raise RuntimeError(f"History key '{k}' is empty.")
+
+        outputs = {
+            "loss.png": ("loss", "Train Loss", hist["train_loss"]),
+            "state_mse.png": ("MSE", "Validation State MSE", hist["val_state_mse"]),
+            "event_bce.png": ("BCE", "Validation Event BCE", hist["val_event_bce"]),
+            "event_accuracy.png": ("accuracy", "Validation Event Accuracy", hist["val_event_acc"]),
+            "train_state_mse.png": ("MSE", "Train State MSE", hist["train_state_mse"]),
+            "train_event_bce.png": ("BCE", "Train Event BCE", hist["train_event_bce"]),
+            "val_loss.png": ("loss", "Validation Loss", hist["val_loss"]),
+        }
+
+        for name, (ylabel, title, values) in outputs.items():
+            save_curve(values, ylabel, title, out_dir / name)
+        save_train_test_overlay(
+            hist["train_loss"],
+            hist["val_loss"],
+            out_dir / "training_overview.png",
+            test_label="val_loss",
+        )
+
+        print("Saved training curves:")
+        for name in outputs:
+            print(" -", out_dir / name)
+        print(" -", out_dir / "training_overview.png")
+        return
 
     required = [
         "train_loss",
